@@ -1,0 +1,17 @@
+[Unit]
+Description=WIDS capture radios into monitor mode
+After=network-pre.target systemd-udevd.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# USB radios enumerate seconds after boot; ath9k_htc also loads firmware first.
+ExecStart=/usr/local/sbin/wids-monitor-setup --wait 60
+TimeoutStartSec=120
+# A radio that failed to come up must not block the rest of the stack; the
+# watchdog timer retries it.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

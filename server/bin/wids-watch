@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""
+wids-watch — live, readable view of the detection stream.
+
+    wids-watch                      # all events
+    wids-watch --type DEAUTH_FLOOD  # only one type (repeatable)
+    wids-watch --min-severity 6     # only the loud stuff
+    wids-watch --occupancy          # include per-channel gauges
+    wids-watch --raw                # raw JSON, one per line (pipe to jq)
+"""
+
+import argparse
+import json
+import sys
+
+import paho.mqtt.client as mqtt
+
+C = {
+    "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
+    "red": "\033[31m", "yel": "\033[33m", "grn": "\033[32m",
+    "cyn": "\033[36m", "mag": "\033[35m", "blu": "\033[34m",
+}
+if not sys.stdout.isatty():
+    C = {k: "" for k in C}
+
+SEV_COLOR = [
+    (8, C["red"] + C["bold"]),
+    (6, C["red"]),
+    (4, C["yel"]),
+    (0, C["cyn"]),
+]
+
+
+def sev_color(sev):
+    for threshold, color in SEV_COLOR:
+        if sev >= threshold:
+            return color
+    return C["cyn"]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=1883)
+    ap.add_argument("--type", action="append", default=[], help="filter to this event type")
+    ap.add_argument("--min-severity", type=int, default=0)
+    ap.add_argument("--occupancy", action="store_true", help="also show channel gauges")
+    ap.add_argument("--rollup", action="store_true", help="also show rollup snapshots")
+    ap.add_argument("--raw", action="store_true", help="print raw JSON lines")
+    args = ap.parse_args()
+
+    wanted = {t.upper() for t in args.type}
+
+    def on_connect(client, userdata, flags, rc, properties=None):
+        client.subscribe("wids/events/#")
+        if args.occupancy:
+            client.subscribe("wids/occupancy/#")
+        if args.rollup:
+            client.subscribe("wids/stats/#")
+        if not args.raw:
+            filt = f" [{', '.join(sorted(wanted))}]" if wanted else ""
+            print(f"{C['dim']}watching {args.host}:{args.port}{filt} — ctrl-c to stop{C['reset']}",
+                  file=sys.stderr)
+
+    def on_message(client, userdata, msg):
+        try:
+            d = json.loads(msg.payload)
+        except Exception:
+            return
+
+        if msg.topic.startswith("wids/occupancy/"):
+            if not args.raw:
+                print(f"{C['dim']}{d.get('ts','')[11:19]}  ch{d.get('channel'):<4} "
+                      f"{d.get('frames_per_s'):>7.1f} f/s   "
+                      f"{d.get('mgmt_frames_per_s'):>6.1f} mgmt/s{C['reset']}", flush=True)
+            else:
+                print(json.dumps(d), flush=True)
+            return
+
+        if msg.topic.startswith("wids/stats/"):
+            print(json.dumps(d, indent=2) if not args.raw else json.dumps(d), flush=True)
+            return
+
+        etype = d.get("type", "?")
+        sev = d.get("severity", 0)
+        if wanted and etype not in wanted:
+            return
+        if sev < args.min_severity:
+            return
+
+        if args.raw:
+            print(json.dumps(d), flush=True)
+            return
+
+        col = sev_color(sev)
+        ts = str(d.get("ts", ""))[11:19]
+        src = d.get("src_mac") or "-"
+        tgt = d.get("target_mac") or "-"
+        vendor = d.get("vendor") or d.get("src_oui") or ""
+        extra = []
+        if d.get("ssid"):
+            extra.append(f"ssid={d['ssid']!r}")
+        if d.get("rate") is not None:
+            extra.append(f"rate={d['rate']}/s")
+        if d.get("count") is not None:
+            extra.append(f"n={d['count']}")
+        if d.get("broadcast"):
+            extra.append("BROADCAST")
+        if d.get("origin") == "kismet":
+            extra.append(f"via-kismet:{d.get('kismet_alert','')}")
+        if d.get("matched"):
+            extra.append(f"match={d['matched']!r}")
+
+        print(f"{ts}  {col}{etype:<18}{C['reset']} "
+              f"{C['dim']}sev{C['reset']}{col}{sev:<3}{C['reset']} "
+              f"{C['blu']}ch{str(d.get('channel','?')):<4}{C['reset']} "
+              f"{C['mag']}{src}{C['reset']} -> {C['grn']}{tgt}{C['reset']} "
+              f"{C['dim']}{vendor} {' '.join(extra)}{C['reset']}", flush=True)
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(args.host, args.port, 60)
+    try:
+        client.loop_forever()
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

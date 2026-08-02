@@ -1,0 +1,31 @@
+[Unit]
+Description=WIDS detection daemon (passive 802.11 signature detection)
+Documentation=file:/etc/wids/README.md
+After=kismet.service mosquitto.service redis-server.service wids-monitor.service
+Wants=mosquitto.service redis-server.service
+Requires=kismet.service
+# Kismet may still be opening its sources when we first connect; the daemon
+# retries internally, so never give up restarting.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wids-detect
+Restart=always
+RestartSec=5
+
+# Passive rig: the daemon reads a local HTTP stream and writes rollups. It has
+# no business touching anything else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/wids
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# AF_NETLINK is required: scapy enumerates routes/interfaces at import time.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

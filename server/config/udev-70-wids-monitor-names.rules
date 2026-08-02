@@ -1,0 +1,14 @@
+# Stable names for WIDS capture radios, keyed on permanent MAC so names survive
+# USB re-enumeration and reboot. wlp2s0 (built-in, management AP) is deliberately
+# absent — it must never be renamed or put in monitor mode.
+#
+# The AA:BB:CC:00:00:0N MACs are PLACEHOLDERS — substitute your own hardware MACs.
+#
+# mon0/mon1 = MT7612U (dual-band 2.4/5GHz)
+# mon2/mon3/mon4 = AR9271 (2.4GHz only)
+
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="AA:BB:CC:00:00:00", NAME="mon0"
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="AA:BB:CC:00:00:01", NAME="mon1"
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="AA:BB:CC:00:00:02", NAME="mon2"
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="AA:BB:CC:00:00:03", NAME="mon3"
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="AA:BB:CC:00:00:04", NAME="mon4"

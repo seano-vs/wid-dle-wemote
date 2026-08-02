@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+wids-selftest — drive synthetic 802.11 frames through the detection logic and
+assert the right event type fires with the right attribution.
+
+Entirely in-memory: nothing is transmitted, no radio is touched, no frame ever
+leaves this process. Safe to run on a live rig at any time.
+
+    sudo wids-selftest
+"""
+
+import importlib.machinery
+import importlib.util
+import sys
+
+import yaml
+from scapy.layers.dot11 import (
+    Dot11,
+    Dot11Auth,
+    Dot11Beacon,
+    Dot11Deauth,
+    Dot11Elt,
+    Dot11ProbeReq,
+    Dot11ProbeResp,
+    RadioTap,
+)
+from scapy.layers.eap import EAPOL
+from scapy.layers.l2 import LLC, SNAP
+
+DAEMON = "/usr/local/sbin/wids-detect"
+CONFIG = "/etc/wids/wids.yaml"
+
+
+def load_daemon():
+    loader = importlib.machinery.SourceFileLoader("wids_detect", DAEMON)
+    spec = importlib.util.spec_from_loader("wids_detect", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class StubSink:
+    """Collects events instead of publishing them."""
+
+    def __init__(self):
+        self.events = []
+        self.ignore_macs = set()
+
+    def emit(self, ev, cooldown_key=None, cooldown_s=0):
+        self.events.append(ev)
+        return True
+
+    def topk(self, *a, **k):
+        pass
+
+    def gauge(self, *a, **k):
+        pass
+
+    def types(self):
+        return [e["type"] for e in self.events]
+
+    def first(self, etype):
+        return next((e for e in self.events if e["type"] == etype), None)
+
+    def reset(self):
+        self.events.clear()
+
+
+def rt(freq=2437):
+    return RadioTap(present="Channel", ChannelFrequency=freq, ChannelFlags=0)
+
+
+def deauth(src, dst, bssid, freq=2437):
+    return rt(freq) / Dot11(type=0, subtype=12, addr1=dst, addr2=src, addr3=bssid) / Dot11Deauth(
+        reason=7
+    )
+
+
+def beacon(bssid, ssid, freq=2437):
+    return (
+        rt(freq)
+        / Dot11(type=0, subtype=8, addr1="ff:ff:ff:ff:ff:ff", addr2=bssid, addr3=bssid)
+        / Dot11Beacon()
+        / Dot11Elt(ID=0, info=ssid.encode())
+    )
+
+
+def probe_req(src, ssid, freq=2437):
+    return (
+        rt(freq)
+        / Dot11(type=0, subtype=4, addr1="ff:ff:ff:ff:ff:ff", addr2=src, addr3="ff:ff:ff:ff:ff:ff")
+        / Dot11ProbeReq()
+        / Dot11Elt(ID=0, info=ssid.encode())
+    )
+
+
+def probe_resp(bssid, dst, ssid, freq=2437):
+    return (
+        rt(freq)
+        / Dot11(type=0, subtype=5, addr1=dst, addr2=bssid, addr3=bssid)
+        / Dot11ProbeResp()
+        / Dot11Elt(ID=0, info=ssid.encode())
+    )
+
+
+def auth(src, bssid, freq=2437):
+    return rt(freq) / Dot11(type=0, subtype=11, addr1=bssid, addr2=src, addr3=bssid) / Dot11Auth(
+        seqnum=1
+    )
+
+
+def eapol(src, dst, bssid, freq=2437):
+    return (
+        rt(freq)
+        / Dot11(type=2, subtype=8, FCfield="from_DS", addr1=dst, addr2=bssid, addr3=src)
+        / LLC(dsap=0xAA, ssap=0xAA, ctrl=3)
+        / SNAP(code=0x888E)
+        / EAPOL(version=2, type=3)
+    )
+
+
+RESULTS = []
+
+
+def check(name, condition, detail=""):
+    RESULTS.append((name, condition, detail))
+    mark = "PASS" if condition else "FAIL"
+    print(f"  [{mark}] {name}" + (f" — {detail}" if detail else ""))
+
+
+def main():
+    mod = load_daemon()
+    cfg = yaml.safe_load(open(CONFIG))
+    sink = StubSink()
+    det = mod.Detectors(cfg, sink)
+
+    ATTACKER = "de:ad:be:ef:00:01"
+    VICTIM = "c0:ff:ee:00:00:02"
+    BSSID = "00:11:22:33:44:55"
+
+    print("\n== DEAUTH_HIT (single targeted kick) ==")
+    sink.reset()
+    det.handle(deauth(ATTACKER, VICTIM, BSSID))
+    ev = sink.first("DEAUTH_HIT")
+    check("DEAUTH_HIT fires", ev is not None)
+    if ev:
+        check("attribution: src", ev["src_mac"] == ATTACKER, ev["src_mac"])
+        check("attribution: target", ev["target_mac"] == VICTIM, ev["target_mac"])
+        check("attribution: channel 6", ev["channel"] == 6, str(ev["channel"]))
+        check("category tagged", ev["frame_category"] == "deauth", ev["frame_category"])
+        check("not flagged broadcast", ev["broadcast"] is False)
+
+    print("\n== DEAUTH_FLOOD (sustained, above flood_rate) ==")
+    sink.reset()
+    n = cfg["detect"]["deauth"]["flood_rate"] * cfg["detect"]["deauth"]["window_s"]
+    for _ in range(n + 5):
+        det.handle(deauth(ATTACKER, VICTIM, BSSID))
+    ev = sink.first("DEAUTH_FLOOD")
+    check("DEAUTH_FLOOD fires", ev is not None)
+    if ev:
+        check("rate >= threshold", ev["rate"] >= cfg["detect"]["deauth"]["flood_rate"],
+              f"rate={ev['rate']}")
+        check("severity is flood-level", ev["severity"] == cfg["detect"]["deauth"]["flood_severity"])
+
+    print("\n== DEAUTH broadcast flagged ==")
+    sink.reset()
+    det2 = mod.Detectors(cfg, sink)
+    det2.handle(deauth(ATTACKER, "ff:ff:ff:ff:ff:ff", BSSID))
+    ev = sink.first("DEAUTH_HIT")
+    check("broadcast deauth flagged", ev is not None and ev["broadcast"] is True)
+
+    print("\n== BEACON_FLOOD (mdk4-style novel BSSID blast) ==")
+    sink.reset()
+    det3 = mod.Detectors(cfg, sink)
+    thresh = cfg["detect"]["beacon_flood"]["novel_bssid_threshold"]
+    for i in range(thresh + 2):
+        det3.handle(beacon(f"00:de:ad:{i:02x}:00:01", f"FakeNet{i}"))
+    ev = sink.first("BEACON_FLOOD")
+    check("BEACON_FLOOD fires", ev is not None)
+    if ev:
+        check("count >= threshold", ev["count"] >= thresh, f"count={ev['count']}")
+
+    print("\n== EVIL_TWIN (same SSID, different vendors) ==")
+    sink.reset()
+    det4 = mod.Detectors(cfg, sink)
+    for b in ("00:aa:aa:00:00:01", "00:bb:bb:00:00:02", "00:cc:cc:00:00:03"):
+        det4.handle(beacon(b, "TotallyRealNet"))
+    ev = sink.first("EVIL_TWIN")
+    check("EVIL_TWIN fires on cross-vendor", ev is not None)
+    if ev:
+        check("ssid attributed", ev["ssid"] == "TotallyRealNet", ev["ssid"])
+        check("distinct OUIs recorded", len(ev["distinct_ouis"]) >= 2, str(ev["distinct_ouis"]))
+
+    print("\n== EVIL_TWIN suppressed for one multi-BSSID vendor (dual-band/mesh) ==")
+    sink.reset()
+    det5 = mod.Detectors(cfg, sink)
+    for b in ("00:aa:aa:00:00:01", "00:aa:aa:00:00:02", "00:aa:aa:00:00:03", "00:aa:aa:00:00:04"):
+        det5.handle(beacon(b, "HomeMeshNet"))
+    check("no false positive on single vendor", sink.first("EVIL_TWIN") is None,
+          "same OUI across BSSIDs must not alert")
+
+    print("\n== KARMA_AP (one BSSID answering many SSIDs) ==")
+    sink.reset()
+    det6 = mod.Detectors(cfg, sink)
+    kt = cfg["detect"]["karma"]["distinct_ssid_threshold"]
+    for i in range(kt + 1):
+        det6.handle(probe_resp(BSSID, VICTIM, f"AnySSID{i}"))
+    ev = sink.first("KARMA_AP")
+    check("KARMA_AP fires", ev is not None)
+    if ev:
+        check("target is the karma BSSID", ev["target_mac"] == BSSID, ev["target_mac"])
+        check("distinct SSID count", ev["count"] >= kt, f"count={ev['count']}")
+
+    print("\n== AUTH_FLOOD (connection-request spam) ==")
+    sink.reset()
+    det7 = mod.Detectors(cfg, sink)
+    at = cfg["detect"]["auth_flood"]["threshold"]
+    for i in range(at + 2):
+        det7.handle(auth(f"00:66:66:{i % 250:02x}:00:01", BSSID))
+    ev = sink.first("AUTH_FLOOD")
+    check("AUTH_FLOOD fires", ev is not None)
+    if ev:
+        check("target BSSID attributed", ev["target_mac"] == BSSID, ev["target_mac"])
+
+    print("\n== HANDSHAKE_SEEN (EAPOL present) ==")
+    sink.reset()
+    det8 = mod.Detectors(cfg, sink)
+    det8.handle(eapol(VICTIM, BSSID, BSSID))
+    ev = sink.first("HANDSHAKE_SEEN")
+    check("HANDSHAKE_SEEN fires", ev is not None)
+    if ev:
+        check("category is eapol", ev["frame_category"] == "eapol", ev["frame_category"])
+
+    print("\n== PROBE_WATCH (operator watchlist) ==")
+    sink.reset()
+    det9 = mod.Detectors(cfg, sink)
+    wl = cfg["detect"]["probe_watch"]["watchlist"]
+    if wl:
+        target_ssid = f"{wl[0]}-network"
+        det9.handle(probe_req(VICTIM, target_ssid))
+        ev = sink.first("PROBE_WATCH")
+        check("PROBE_WATCH fires on watchlist hit", ev is not None)
+        if ev:
+            check("matched term recorded", ev["matched"] == wl[0].lower(), str(ev.get("matched")))
+            check("client attributed", ev["src_mac"] == VICTIM, ev["src_mac"])
+        sink.reset()
+        det9.handle(probe_req(VICTIM, "some-unrelated-ssid"))
+        check("no alert for off-watchlist SSID", sink.first("PROBE_WATCH") is None)
+
+    print("\n== 5GHz channel derivation ==")
+    sink.reset()
+    det10 = mod.Detectors(cfg, sink)
+    det10.handle(deauth(ATTACKER, VICTIM, BSSID, freq=5180))
+    ev = sink.first("DEAUTH_HIT")
+    check("5180MHz maps to channel 36", ev is not None and ev["channel"] == 36,
+          str(ev["channel"]) if ev else "no event")
+
+    failed = [n for n, ok, _ in RESULTS if not ok]
+    print(f"\n{'=' * 60}")
+    print(f"{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
+    if failed:
+        print("FAILED:")
+        for f in failed:
+            print(f"  - {f}")
+        return 1
+    print("ALL DETECTORS VERIFIED")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

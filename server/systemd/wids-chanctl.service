@@ -1,0 +1,19 @@
+[Unit]
+Description=WIDS dynamic channel controller (parks tracker radios on hot channels)
+After=wids-detect.service mosquitto.service wids-monitor.service
+Wants=wids-detect.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wids-chanctl
+Restart=always
+RestartSec=5
+# Only needs to run `iw` and talk to the local broker.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

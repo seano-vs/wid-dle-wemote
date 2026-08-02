@@ -1,0 +1,128 @@
+#!/bin/bash
+# wids-add-radio — provision a freshly plugged capture radio in one step.
+#
+# Plug ONE new USB WiFi stick in, then run:  sudo wids-add-radio
+# It finds the new interface, assigns the next monN name, and wires up:
+#   - the udev rule (MAC -> monN, stable across reboots/re-enumeration)
+#   - /etc/wids/radios.conf         (role + channel pool)
+#   - Kismet source line in kismet_site.conf
+# then reloads udev, renames the interface, and restarts the capture stack.
+#
+# Usage:
+#   sudo wids-add-radio                         # interactive
+#   sudo wids-add-radio --role tracker --pool 52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144
+#   sudo wids-add-radio --role scout   --pool 36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165
+#   sudo wids-add-radio --role pin     --pool 149
+#   sudo wids-add-radio --pretend ...           # show what it would do, change nothing
+
+set -uo pipefail
+
+CONF=/etc/wids/radios.conf
+UDEV=/etc/udev/rules.d/70-wids-monitor-names.rules
+KISMET=/etc/kismet/kismet_site.conf
+HOPRATE="5/sec"
+
+ROLE=""; POOL=""; PRETEND=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --role) ROLE="$2"; shift 2;;
+    --pool) POOL="$2"; shift 2;;
+    --pretend) PRETEND=1; shift;;
+    *) echo "unknown arg: $1"; exit 2;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "run as root: sudo wids-add-radio"; exit 1; }
+
+# ---- find the new, unclaimed interface -----------------------------------
+# A provisioned radio has a monN name; a fresh stick is still wlx<mac>.
+mapfile -t NEW < <(ls /sys/class/net/ | grep -E '^wl' | grep -vE '^wlp2s0$|^mon[0-9]+$')
+if (( ${#NEW[@]} == 0 )); then
+  echo "No new capture radio found (nothing named wlx* that isn't already a monN)."
+  echo "Plug the stick in and wait a few seconds — ath9k needs to load firmware."
+  exit 1
+fi
+if (( ${#NEW[@]} > 1 )); then
+  echo "More than one unclaimed interface: ${NEW[*]}"
+  echo "Add them one at a time (unplug the others), so names are assigned cleanly."
+  exit 1
+fi
+IFACE=${NEW[0]}
+MAC=$(cat "/sys/class/net/$IFACE/address")
+
+# chipset (best effort, for the radios.conf column + a sanity note)
+DRV=$(basename "$(readlink -f "/sys/class/net/$IFACE/device/driver" 2>/dev/null)" 2>/dev/null)
+case "$DRV" in
+  mt76*) CHIP=mt7612u;;
+  ath9k*) CHIP=ar9271;;
+  *) CHIP=${DRV:-unknown};;
+esac
+
+# ---- next monN -----------------------------------------------------------
+# Highest provisioned monN. Count only ACTIVE radios.conf lines (skip the
+# commented mon5/mon6 example block) and the udev NAME= assignments — never
+# raw filenames or comments.
+LAST=$( { awk '!/^#/ && NF {print $1}' "$CONF"; grep -oE 'NAME="mon[0-9]+"' "$UDEV"; } 2>/dev/null \
+        | grep -oE 'mon[0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 )
+NEXT="mon$(( ${LAST:-(-1)} + 1 ))"
+
+echo "New radio:   $IFACE  mac=$MAC  chipset=$CHIP  ->  $NEXT"
+
+# ---- role + pool ---------------------------------------------------------
+if [[ -z $ROLE ]]; then
+  read -rp "Role [pin/hop/scout/tracker]: " ROLE
+fi
+case "$ROLE" in pin|hop|scout|tracker) ;; *) echo "bad role: $ROLE"; exit 2;; esac
+if [[ -z $POOL ]]; then
+  read -rp "Channel(s), comma-separated (single channel for pin): " POOL
+fi
+[[ -n $POOL ]] || { echo "no channels given"; exit 2; }
+FIRST=${POOL%%,*}
+
+# ---- build the config lines ----------------------------------------------
+UDEV_LINE="SUBSYSTEM==\"net\", ACTION==\"add\", ATTR{address}==\"$MAC\", NAME=\"$NEXT\""
+CONF_LINE="$NEXT $MAC $CHIP $ROLE $POOL"
+case "$ROLE" in
+  pin)
+    KIS_LINE="source=$NEXT:name=${NEXT},channel=$FIRST,channel_hop=false";;
+  tracker)
+    # non-hopping: wids-chanctl owns the channel via iw
+    KIS_LINE="source=$NEXT:name=${NEXT},channel=$FIRST,channel_hop=false";;
+  hop|scout)
+    KIS_LINE="source=$NEXT:name=${NEXT},channels=\"$POOL\",channel_hop=true,channel_hoprate=$HOPRATE";;
+esac
+
+echo
+echo "Will write:"
+echo "  udev  : $UDEV_LINE"
+echo "  radios: $CONF_LINE"
+echo "  kismet: $KIS_LINE"
+echo
+
+if (( PRETEND )); then
+  echo "(--pretend) nothing changed."
+  exit 0
+fi
+
+read -rp "Proceed? [y/N] " ans
+[[ ${ans,,} == y || ${ans,,} == yes ]] || { echo "aborted."; exit 0; }
+
+# ---- apply ---------------------------------------------------------------
+printf '%s\n' "$UDEV_LINE" >> "$UDEV"
+printf '%s\n' "$CONF_LINE" >> "$CONF"
+printf '%s\n' "$KIS_LINE"  >> "$KISMET"
+
+udevadm control --reload-rules
+# rename now (needs the iface down); udev will do it automatically on next plug
+ip link set "$IFACE" down 2>/dev/null
+ip link set "$IFACE" name "$NEXT" 2>/dev/null && echo "renamed $IFACE -> $NEXT"
+
+/usr/local/sbin/wids-monitor-setup
+systemctl restart kismet
+sleep 5
+systemctl restart wids-chanctl
+
+echo
+echo "Done. $NEXT added as role=$ROLE."
+[[ $ROLE == tracker ]] && echo "Reminder: set chanctl.dry_run: false in /etc/wids/wids.yaml to activate tracking, then: systemctl restart wids-chanctl"
+echo "Verify with: sudo wids-healthcheck"

@@ -1,0 +1,135 @@
+#!/bin/bash
+# wids-healthcheck — one-shot green/red status for the whole rig.
+#   sudo wids-healthcheck
+# Exit 0 = all green, 1 = something is down.
+
+RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; RST=$'\033[0m'
+[[ -t 1 ]] || { RED=""; GRN=""; YLW=""; RST=""; }
+
+FAIL=0
+ok()   { echo "  ${GRN}[ OK ]${RST} $*"; }
+bad()  { echo "  ${RED}[FAIL]${RST} $*"; FAIL=1; }
+warn() { echo "  ${YLW}[WARN]${RST} $*"; }
+
+CONF=/etc/wids/radios.conf
+AP_IFACE=$(awk -F': *' '/^ap_interface:/{print $2}' /etc/wids/wids.yaml 2>/dev/null)
+AP_IFACE=${AP_IFACE:-wlp2s0}
+PROM_PORT=$(awk '/^prometheus:/{f=1} f&&/port:/{print $2; exit}' /etc/wids/wids.yaml 2>/dev/null)
+PROM_PORT=${PROM_PORT:-9924}
+
+echo
+echo "=== services ==="
+for svc in hostapd dnsmasq wids-monitor mosquitto redis-server kismet wids-detect wids-chanctl; do
+    state=$(systemctl is-active "$svc" 2>/dev/null)
+    if [[ $state == active ]]; then ok "$svc"; else bad "$svc ($state)"; fi
+done
+if systemctl is-active wids-monitor-watchdog.timer &>/dev/null; then
+    ok "wids-monitor-watchdog.timer"
+else
+    bad "wids-monitor-watchdog.timer inactive"
+fi
+
+echo
+echo "=== management AP ($AP_IFACE) ==="
+if iw dev "$AP_IFACE" info 2>/dev/null | grep -q 'type AP'; then
+    ssid=$(iw dev "$AP_IFACE" info | awk '/ssid/{$1="";print substr($0,2)}')
+    chan=$(iw dev "$AP_IFACE" info | awk '/channel/{print $2}')
+    ok "AP up: \"$ssid\" on ch$chan"
+else
+    bad "$AP_IFACE is not in AP mode"
+fi
+addr=$(ip -br addr show "$AP_IFACE" 2>/dev/null | awk '{print $3}')
+[[ -n $addr ]] && ok "AP address $addr" || bad "$AP_IFACE has no address"
+pgrep -x dnsmasq >/dev/null && ok "DHCP server running" || bad "dnsmasq not running"
+
+echo
+echo "=== capture radios ==="
+while read -r iface mac chipset mode chans; do
+    [[ -z ${iface:-} || $iface == \#* ]] && continue
+    if [[ ! -e /sys/class/net/$iface ]]; then
+        bad "$iface absent from the USB bus"
+        continue
+    fi
+    itype=$(iw dev "$iface" info 2>/dev/null | awk '/^\ttype /{print $2}')
+    ichan=$(iw dev "$iface" info 2>/dev/null | awk '/channel/{print $2}')
+    if [[ $itype != monitor ]]; then
+        bad "$iface type=$itype (expected monitor)"
+    elif [[ $mode == pin && $ichan != "${chans%%,*}" ]]; then
+        bad "$iface pinned to ch${chans%%,*} but sits on ch$ichan"
+    else
+        ok "$iface ($chipset) monitor ch$ichan [$mode]"
+    fi
+done < "$CONF"
+
+echo
+echo "=== capture layer ==="
+if [[ -r /etc/wids/kismet.creds ]]; then
+    . /etc/wids/kismet.creds
+    src=$(curl -s --max-time 5 -u "$KISMET_USER:$KISMET_PASS" \
+          http://127.0.0.1:2501/datasource/all_sources.json 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("ERR"); raise SystemExit
+run=[s for s in d if s["kismet.datasource.running"]]
+pk=sum(s["kismet.datasource.num_packets"] for s in d)
+print(f"{len(run)}/{len(d)} {pk}")' 2>/dev/null)
+    if [[ $src == ERR || -z $src ]]; then
+        bad "Kismet REST not answering"
+    else
+        read -r ratio pkts <<<"$src"
+        [[ ${ratio%%/*} == "${ratio##*/}" ]] \
+            && ok "Kismet sources $ratio running, $pkts packets" \
+            || bad "Kismet sources $ratio running"
+    fi
+else
+    bad "/etc/wids/kismet.creds missing"
+fi
+
+echo
+echo "=== event bus ==="
+if timeout 4 mosquitto_sub -h 127.0.0.1 -t 'wids/#' -C 1 &>/dev/null; then
+    ok "MQTT delivering on wids/#"
+else
+    warn "no message on wids/# within 4s (quiet air is possible)"
+fi
+
+echo
+echo "=== metrics ==="
+m=$(curl -s --max-time 5 "http://localhost:${PROM_PORT}/metrics" 2>/dev/null)
+if [[ -z $m ]]; then
+    bad "exporter not answering on :$PROM_PORT"
+else
+    ok "exporter up on :$PROM_PORT"
+    [[ $(grep -c '^wids_frames_total' <<<"$m") -gt 0 ]] \
+        && ok "frame counters: $(grep -c '^wids_frames_total' <<<"$m") categories" \
+        || bad "no frame counters"
+    up=$(awk '/^wids_capture_stream_up/{print $2}' <<<"$m")
+    [[ $up == 1.0 ]] && ok "frame stream connected" || bad "frame stream down"
+
+    # Frames must actually be moving, not just present from an old run.
+    a=$(awk '/^wids_frames_total/{s+=$2} END{print s+0}' <<<"$m")
+    sleep 3
+    b=$(curl -s --max-time 5 "http://localhost:${PROM_PORT}/metrics" \
+        | awk '/^wids_frames_total/{s+=$2} END{print s+0}')
+    if (( $(echo "$b > $a" | bc -l) )); then
+        ok "metrics incrementing ($a -> $b frames)"
+    else
+        warn "frame count static at $a over 3s (very quiet air?)"
+    fi
+fi
+
+echo
+echo "=== privacy / storage constraints ==="
+pc=$(find / -xdev \( -name '*.pcap' -o -name '*.pcapng' -o -name '*.kismet' \) \
+     -type f 2>/dev/null | grep -v '^/usr/share' | head -5)
+[[ -z $pc ]] && ok "no capture files on disk" || bad "capture files found: $pc"
+
+echo
+if (( FAIL )); then
+    echo "${RED}RESULT: one or more checks FAILED${RST}"
+else
+    echo "${GRN}RESULT: all green${RST}"
+fi
+exit $FAIL

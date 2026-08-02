@@ -1,0 +1,97 @@
+#!/bin/bash
+# Put every WIDS capture radio into monitor mode on its assigned channel.
+# Idempotent: safe to re-run at boot, from the watchdog, or by hand.
+#
+# Passive only — this sets monitor mode and channels. It never associates,
+# never transmits, and never touches the management AP radio.
+#
+# Roles (column 4 of radios.conf):
+#   pin/hop/scout -> set the landing channel (Kismet hops hop/scout afterwards)
+#   tracker       -> monitor + up only; NO channel is set here. wids-chanctl
+#                    owns a tracker's channel, so pinning one here (or on each
+#                    watchdog run) would fight the controller.
+#
+# --wait N   poll up to N seconds for radios to appear before giving up on them.
+#            USB radios (esp. ath9k_htc, which loads firmware) enumerate several
+#            seconds after systemd starts this unit at boot.
+
+set -uo pipefail
+
+CONF=/etc/wids/radios.conf
+AP_IFACE=wlp2s0
+WAIT=0
+
+[[ ${1:-} == --wait ]] && WAIT=${2:-60}
+
+log() { logger -t wids-monitor -s "$*"; }
+
+[[ -r $CONF ]] || { log "FATAL: $CONF unreadable"; exit 1; }
+
+mapfile -t IFACES < <(awk '!/^#/ && NF {print $1}' "$CONF")
+
+if (( WAIT > 0 )); then
+    deadline=$(( SECONDS + WAIT ))
+    while (( SECONDS < deadline )); do
+        missing=0
+        for i in "${IFACES[@]}"; do
+            [[ -e /sys/class/net/$i ]] || missing=1
+        done
+        (( missing == 0 )) && break
+        sleep 2
+    done
+fi
+
+set_monitor_up() {
+    local iface=$1
+    local cur_type
+    cur_type=$(iw dev "$iface" info 2>/dev/null | awk '/^\ttype /{print $2}')
+    if [[ $cur_type != monitor ]]; then
+        ip link set "$iface" down
+        if ! iw dev "$iface" set type monitor; then
+            log "$iface: failed to set monitor mode"
+            return 1
+        fi
+    fi
+    ip link set "$iface" up
+}
+
+configure_radio() {
+    local iface=$1 chipset=$2 role=$3 chans=$4
+
+    set_monitor_up "$iface" || return 1
+
+    # tracker: leave the channel to wids-chanctl. Just make sure it's live.
+    if [[ $role == tracker ]]; then
+        log "$iface ($chipset) monitor, up, tracker — channel owned by wids-chanctl"
+        return 0
+    fi
+
+    # pin/hop/scout: land on the first channel in the list. Kismet re-hops
+    # hop/scout sources after it opens them.
+    local ch=${chans%%,*}
+    if ! iw dev "$iface" set channel "$ch" 2>/dev/null; then
+        log "$iface: failed to set channel $ch"
+        return 1
+    fi
+    log "$iface ($chipset) monitor, ch$ch, role=$role"
+}
+
+rc=0
+while read -r iface mac chipset role chans; do
+    [[ -z ${iface:-} || $iface == \#* ]] && continue
+
+    if [[ $iface == "$AP_IFACE" ]]; then
+        log "REFUSING to touch AP interface $AP_IFACE"
+        continue
+    fi
+
+    if [[ ! -e /sys/class/net/$iface ]]; then
+        log "$iface: absent (USB dropped?) — skipping"
+        rc=1
+        continue
+    fi
+
+    configure_radio "$iface" "$chipset" "$role" "$chans" || rc=1
+done < "$CONF"
+
+exit $rc

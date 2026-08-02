@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+"""
+wids-detect — passive 802.11 detection daemon.
+
+Capture layer is Kismet: it owns the radios, channel hopping and per-source
+state, and exposes a live pcapng stream plus its own WIDS alert eventbus. This
+daemon consumes both, runs signature detection over sliding time windows, and
+emits normalized events onto MQTT.
+
+Passive only. Nothing here transmits, associates, or injects. Frame bodies are
+parsed for features and dropped; no packet payloads are written to disk.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import sqlite3
+import threading
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from pathlib import Path
+
+import paho.mqtt.client as mqtt
+import redis
+import requests
+import yaml
+from prometheus_client import Counter, Gauge, start_http_server
+from scapy.layers.dot11 import Dot11, Dot11Elt, RadioTap
+from scapy.layers.eap import EAPOL
+from scapy.utils import PcapNgReader
+
+log = logging.getLogger("wids")
+
+CONFIG_PATH = os.environ.get("WIDS_CONFIG", "/etc/wids/wids.yaml")
+
+# 802.11 management subtypes -> the frame category we report. Every frame gets
+# tagged with its category, whether or not it ever trips a detector.
+MGMT_SUBTYPES = {
+    0: "assoc_req",
+    1: "assoc_resp",
+    2: "reassoc_req",
+    3: "reassoc_resp",
+    4: "probe_req",
+    5: "probe_resp",
+    8: "beacon",
+    9: "atim",
+    10: "disassoc",
+    11: "auth",
+    12: "deauth",
+    13: "action",
+}
+
+BROADCAST = "ff:ff:ff:ff:ff:ff"
+NULL_MAC = "00:00:00:00:00:00"
+
+
+def own_macs(ap_iface):
+    """Our own AP's MAC, so the rig doesn't show up as the loudest device in
+    its own top-K. Best effort — an unreadable interface is not fatal."""
+    macs = set()
+    try:
+        addr = Path(f"/sys/class/net/{ap_iface}/address").read_text().strip().lower()
+        if addr:
+            macs.add(addr)
+    except Exception:
+        pass
+    return macs
+
+
+# --------------------------------------------------------------------------
+# metrics — low cardinality only. Per-MAC/per-SSID detail lives in Redis
+# top-K, never in a Prometheus label.
+# --------------------------------------------------------------------------
+
+M_EVENTS = Counter("wids_events_total", "Detection events emitted", ["type", "channel"])
+M_FRAMES = Counter("wids_frames_total", "Frames observed by category", ["type"])
+M_EVENTS_HOUR = Counter(
+    "wids_events_by_hour_total", "Detection events by hour of day", ["type", "hour"]
+)
+M_OCCUPANCY = Gauge("wids_channel_occupancy", "Frames/sec observed per channel", ["channel"])
+M_MGMT_RATE = Gauge("wids_channel_mgmt_rate", "Mgmt frames/sec per channel", ["channel"])
+M_STREAM_UP = Gauge("wids_capture_stream_up", "1 when the Kismet frame stream is connected")
+M_ALERTS_UP = Gauge("wids_kismet_alertbus_up", "1 when the Kismet alert eventbus is connected")
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+
+def freq_to_channel(freq):
+    """Radiotap reports MHz; the rest of the rig speaks channel numbers."""
+    if not freq:
+        return 0
+    if freq == 2484:
+        return 14
+    if 2412 <= freq <= 2472:
+        return (freq - 2407) // 5
+    if 5000 < freq < 5900:
+        return (freq - 5000) // 5
+    if 5955 <= freq <= 7115:  # 6GHz, for completeness
+        return (freq - 5955) // 5 + 1
+    return 0
+
+
+def oui_of(mac):
+    return mac[:8].upper() if mac and len(mac) >= 8 else ""
+
+
+_MANUF_CACHE = {}
+
+
+def vendor_of(mac):
+    """Best-effort OUI vendor lookup; never fatal if the db is unavailable."""
+    if not mac:
+        return ""
+    prefix = oui_of(mac)
+    if prefix in _MANUF_CACHE:
+        return _MANUF_CACHE[prefix]
+    name = ""
+    try:
+        from scapy.data import MANUFDB
+
+        name = MANUFDB._get_manuf(mac) or ""
+        if name == mac:  # scapy echoes the mac back when it has no match
+            name = ""
+    except Exception:
+        name = ""
+    _MANUF_CACHE[prefix] = name
+    return name
+
+
+def ssid_from(pkt):
+    """Pull the SSID element out of a beacon/probe. '' means wildcard/hidden."""
+    try:
+        elt = pkt.getlayer(Dot11Elt)
+        while elt is not None:
+            if elt.ID == 0:
+                return elt.info.decode("utf-8", "replace")
+            elt = elt.payload.getlayer(Dot11Elt)
+    except Exception:
+        pass
+    return ""
+
+
+class SlidingWindow:
+    """Timestamps in a window, keyed. Prunes lazily on touch."""
+
+    def __init__(self, window_s):
+        self.window_s = window_s
+        self._d = defaultdict(deque)
+
+    def add(self, key, now=None):
+        now = now or time.time()
+        dq = self._d[key]
+        dq.append(now)
+        self._prune(dq, now)
+        return len(dq)
+
+    def count(self, key, now=None):
+        now = now or time.time()
+        dq = self._d.get(key)
+        if not dq:
+            return 0
+        self._prune(dq, now)
+        return len(dq)
+
+    def _prune(self, dq, now):
+        cutoff = now - self.window_s
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+    def sweep(self):
+        """Drop empty keys so memory can't grow without bound."""
+        now = time.time()
+        for k in list(self._d.keys()):
+            dq = self._d[k]
+            self._prune(dq, now)
+            if not dq:
+                del self._d[k]
+
+
+class SlidingSet:
+    """Distinct values seen per key inside a window."""
+
+    def __init__(self, window_s):
+        self.window_s = window_s
+        self._d = defaultdict(dict)  # key -> {value: last_seen}
+
+    def add(self, key, value, now=None):
+        now = now or time.time()
+        m = self._d[key]
+        m[value] = now
+        self._prune(m, now)
+        return len(m)
+
+    def values(self, key, now=None):
+        now = now or time.time()
+        m = self._d.get(key)
+        if not m:
+            return []
+        self._prune(m, now)
+        return list(m.keys())
+
+    def _prune(self, m, now):
+        cutoff = now - self.window_s
+        for v in [v for v, ts in m.items() if ts < cutoff]:
+            del m[v]
+
+    def sweep(self):
+        now = time.time()
+        for k in list(self._d.keys()):
+            m = self._d[k]
+            self._prune(m, now)
+            if not m:
+                del self._d[k]
+
+
+# --------------------------------------------------------------------------
+# event sink — MQTT + Prometheus + Redis top-K + SQLite rollups
+# --------------------------------------------------------------------------
+
+
+class EventSink:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.prefix = cfg["mqtt"]["topic_prefix"]
+        self._cooldown = {}
+        self._lock = threading.Lock()
+
+        # The rig's own AP beacons constantly on a channel we monitor; without
+        # this it wins "most-seen MAC" every time and drowns the real signal.
+        self.ignore_macs = own_macs(cfg.get("ap_interface", "wlp2s0"))
+        self.ignore_macs |= {m.lower() for m in cfg.get("ignore_macs", [])}
+        if self.ignore_macs:
+            log.info("excluding own/ignored MACs from metrics: %s", sorted(self.ignore_macs))
+
+        self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="wids-detect")
+        self.mqtt.reconnect_delay_set(min_delay=1, max_delay=30)
+        self.mqtt.connect_async(cfg["mqtt"]["host"], cfg["mqtt"]["port"], keepalive=30)
+        self.mqtt.loop_start()
+
+        self.topk_size = cfg["redis"]["topk_size"]
+        try:
+            self.redis = redis.Redis(
+                host=cfg["redis"]["host"],
+                port=cfg["redis"]["port"],
+                db=cfg["redis"]["db"],
+                socket_timeout=2,
+                decode_responses=True,
+            )
+            self.redis.ping()
+        except Exception as exc:
+            log.warning("redis unavailable, top-K disabled: %s", exc)
+            self.redis = None
+
+        self.counts_by_type = defaultdict(int)
+
+    def emit(self, ev, cooldown_key=None, cooldown_s=0):
+        """Publish one detection. cooldown_key suppresses repeat spam."""
+        if cooldown_key and cooldown_s:
+            now = time.time()
+            with self._lock:
+                last = self._cooldown.get(cooldown_key, 0)
+                if now - last < cooldown_s:
+                    return False
+                self._cooldown[cooldown_key] = now
+
+        ev.setdefault("ts", datetime.now(timezone.utc).isoformat())
+        etype = ev["type"]
+        chan = str(ev.get("channel", 0))
+
+        M_EVENTS.labels(type=etype, channel=chan).inc()
+        M_EVENTS_HOUR.labels(type=etype, hour=str(datetime.now().hour)).inc()
+        with self._lock:
+            self.counts_by_type[etype] += 1
+
+        self.mqtt.publish(f"{self.prefix}/events/{etype}", json.dumps(ev), qos=0, retain=False)
+
+        # Bounded top-K of who is being hit hardest.
+        tgt = ev.get("target_mac")
+        if tgt and tgt != BROADCAST:
+            self.topk("attacked_bssids", tgt)
+        log.info("EVENT %s sev=%s ch=%s src=%s tgt=%s", etype, ev.get("severity"),
+                 ev.get("channel"), ev.get("src_mac"), tgt)
+        return True
+
+    def topk(self, name, member, amount=1):
+        """ZINCRBY into a sorted set, trimmed so cardinality stays bounded."""
+        if not self.redis or not member or member in self.ignore_macs:
+            return
+        if member in (NULL_MAC, BROADCAST):
+            return
+        try:
+            key = f"wids:topk:{name}"
+            self.redis.zincrby(key, amount, member)
+            if self.redis.zcard(key) > self.topk_size * 2:
+                self.redis.zremrangebyrank(key, 0, -(self.topk_size + 1))
+        except Exception as exc:
+            log.debug("topk write failed: %s", exc)
+
+    def gauge(self, topic, payload):
+        """Gauge topics retain their last value for late-joining consumers."""
+        self.mqtt.publish(f"{self.prefix}/{topic}", json.dumps(payload), qos=0, retain=True)
+
+    def top_snapshot(self, name, n=10):
+        if not self.redis:
+            return []
+        try:
+            return [
+                {"key": m, "count": int(s)}
+                for m, s in self.redis.zrevrange(f"wids:topk:{name}", 0, n - 1, withscores=True)
+            ]
+        except Exception:
+            return []
+
+    def counts_copy(self):
+        """Thread-safe snapshot of the per-type counters."""
+        with self._lock:
+            return dict(self.counts_by_type)
+
+    def maintenance(self, max_age_s=900):
+        """Drop cooldown entries older than any cooldown window in use, so the
+        map can't grow without bound over a long run. Longest cooldown is the
+        evil-twin window (~300s); 900s leaves a wide margin, and the worst case
+        of dropping a still-live entry is one extra (un-suppressed) event."""
+        cutoff = time.time() - max_age_s
+        with self._lock:
+            stale = [k for k, ts in self._cooldown.items() if ts < cutoff]
+            for k in stale:
+                del self._cooldown[k]
+        if stale:
+            log.debug("pruned %d stale cooldown entries", len(stale))
+
+
+# --------------------------------------------------------------------------
+# detectors
+# --------------------------------------------------------------------------
+
+
+class Detectors:
+    def __init__(self, cfg, sink):
+        d = cfg["detect"]
+        self.cfg = d
+        self.sink = sink
+
+        self.deauth_win = SlidingWindow(d["deauth"]["window_s"])
+        self.beacon_bssids = SlidingSet(d["beacon_flood"]["window_s"])
+        self.ssid_bssids = SlidingSet(d["evil_twin"]["window_s"])
+        self.karma_ssids = SlidingSet(d["karma"]["window_s"])
+        self.auth_win = SlidingWindow(d["auth_flood"]["window_s"])
+        self.handshake_win = SlidingWindow(d["handshake"]["window_s"])
+
+        self.watchlist = [w.lower() for w in d["probe_watch"]["watchlist"]]
+
+        # Channel occupancy: all frames and mgmt-only frames.
+        self.occ_all = SlidingWindow(d["occupancy"]["window_s"])
+        self.occ_mgmt = SlidingWindow(d["occupancy"]["window_s"])
+        self.channels_seen = set()
+
+        # handle() runs in the frame-stream thread; occupancy_loop reads the same
+        # windows/sets and sweeps them from another thread. This makes those two
+        # mutually exclusive so a prune can't race an append (IndexError) or a
+        # set iteration race an add (RuntimeError).
+        self.lock = threading.Lock()
+
+    # -- individual signatures -------------------------------------------
+
+    def on_deauth(self, cat, src, dst, bssid, chan):
+        c = self.cfg["deauth"]
+        target = dst or bssid
+        n = self.deauth_win.add(("deauth", target))
+        rate = n / max(c["window_s"], 1)
+        broadcast = dst == BROADCAST
+
+        if rate >= c["flood_rate"]:
+            self.sink.emit(
+                {
+                    "type": "DEAUTH_FLOOD",
+                    "severity": c["flood_severity"],
+                    "channel": chan,
+                    "src_mac": src,
+                    "src_oui": oui_of(src),
+                    "vendor": vendor_of(src),
+                    "target_mac": target,
+                    "count": n,
+                    "rate": round(rate, 2),
+                    "window_s": c["window_s"],
+                    "frame_category": cat,
+                    "broadcast": broadcast,
+                },
+                cooldown_key=("DEAUTH_FLOOD", target),
+                cooldown_s=c["window_s"],
+            )
+        else:
+            self.sink.emit(
+                {
+                    "type": "DEAUTH_HIT",
+                    "severity": c["hit_severity"],
+                    "channel": chan,
+                    "src_mac": src,
+                    "src_oui": oui_of(src),
+                    "vendor": vendor_of(src),
+                    "target_mac": target,
+                    "count": n,
+                    "rate": round(rate, 2),
+                    "window_s": c["window_s"],
+                    "frame_category": cat,
+                    "broadcast": broadcast,
+                },
+                cooldown_key=("DEAUTH_HIT", src, target),
+                cooldown_s=2,
+            )
+
+    def on_beacon(self, src, bssid, ssid, chan):
+        c = self.cfg["beacon_flood"]
+        n = self.beacon_bssids.add(chan, bssid)
+        if n >= c["novel_bssid_threshold"]:
+            self.sink.emit(
+                {
+                    "type": "BEACON_FLOOD",
+                    "severity": c["severity"],
+                    "channel": chan,
+                    "src_mac": src,
+                    "src_oui": oui_of(src),
+                    "vendor": vendor_of(src),
+                    "target_mac": None,
+                    "count": n,
+                    "window_s": c["window_s"],
+                    "frame_category": "beacon",
+                },
+                cooldown_key=("BEACON_FLOOD", chan),
+                cooldown_s=c["window_s"],
+            )
+
+        if ssid:
+            self.sink.topk("ssids", ssid)
+            e = self.cfg["evil_twin"]
+            n2 = self.ssid_bssids.add(ssid, bssid)
+            if n2 >= e["min_bssids"]:
+                # One SSID on several BSSIDs is normal: dual-band APs, mesh
+                # kits and enterprise deployments all do it. What separates a
+                # spoof from that is hardware from a *different* vendor
+                # claiming the same network, so require distinct OUIs too.
+                bssids = self.ssid_bssids.values(ssid)
+                ouis = {oui_of(b) for b in bssids if b}
+                if len(ouis) >= e["min_distinct_ouis"]:
+                    self.sink.emit(
+                        {
+                            "type": "EVIL_TWIN",
+                            "severity": e["severity"],
+                            "channel": chan,
+                            "src_mac": src,
+                            "src_oui": oui_of(src),
+                            "vendor": vendor_of(src),
+                            "target_mac": bssid,
+                            "ssid": ssid,
+                            "bssids": bssids,
+                            "distinct_ouis": sorted(ouis),
+                            "count": n2,
+                            "window_s": e["window_s"],
+                            "frame_category": "beacon",
+                        },
+                        cooldown_key=("EVIL_TWIN", ssid),
+                        cooldown_s=e["window_s"],
+                    )
+
+    def on_probe_req(self, src, ssid, chan):
+        if not ssid:
+            return
+        self.sink.topk("probed_ssids", ssid)
+        hit = next((w for w in self.watchlist if w in ssid.lower()), None)
+        if hit:
+            c = self.cfg["probe_watch"]
+            self.sink.emit(
+                {
+                    "type": "PROBE_WATCH",
+                    "severity": c["severity"],
+                    "channel": chan,
+                    "src_mac": src,
+                    "src_oui": oui_of(src),
+                    "vendor": vendor_of(src),
+                    "target_mac": None,
+                    "ssid": ssid,
+                    "matched": hit,
+                    "frame_category": "probe_req",
+                },
+                cooldown_key=("PROBE_WATCH", src, ssid),
+                cooldown_s=30,
+            )
+
+    def on_probe_resp(self, src, bssid, ssid, chan):
+        if not ssid:
+            return
+        c = self.cfg["karma"]
+        n = self.karma_ssids.add(bssid, ssid)
+        if n >= c["distinct_ssid_threshold"]:
+            self.sink.emit(
+                {
+                    "type": "KARMA_AP",
+                    "severity": c["severity"],
+                    "channel": chan,
+                    "src_mac": src,
+                    "src_oui": oui_of(src),
+                    "vendor": vendor_of(src),
+                    "target_mac": bssid,
+                    "count": n,
+                    "ssids": self.karma_ssids.values(bssid)[:20],
+                    "window_s": c["window_s"],
+                    "frame_category": "probe_resp",
+                },
+                cooldown_key=("KARMA_AP", bssid),
+                cooldown_s=c["window_s"],
+            )
+
+    def on_auth_assoc(self, cat, src, bssid, chan):
+        c = self.cfg["auth_flood"]
+        n = self.auth_win.add(("auth", bssid))
+        if n >= c["threshold"]:
+            self.sink.emit(
+                {
+                    "type": "AUTH_FLOOD",
+                    "severity": c["severity"],
+                    "channel": chan,
+                    "src_mac": src,
+                    "src_oui": oui_of(src),
+                    "vendor": vendor_of(src),
+                    "target_mac": bssid,
+                    "count": n,
+                    "rate": round(n / max(c["window_s"], 1), 2),
+                    "window_s": c["window_s"],
+                    "frame_category": cat,
+                },
+                cooldown_key=("AUTH_FLOOD", bssid),
+                cooldown_s=c["window_s"],
+            )
+
+    def on_eapol(self, src, dst, bssid, chan):
+        c = self.cfg["handshake"]
+        n = self.handshake_win.add(("eapol", bssid))
+        self.sink.emit(
+            {
+                "type": "HANDSHAKE_SEEN",
+                "severity": c["severity"],
+                "channel": chan,
+                "src_mac": src,
+                "src_oui": oui_of(src),
+                "vendor": vendor_of(src),
+                "target_mac": bssid,
+                "count": n,
+                "window_s": c["window_s"],
+                "frame_category": "eapol",
+            },
+            cooldown_key=("HANDSHAKE_SEEN", bssid),
+            cooldown_s=10,
+        )
+
+    # -- main frame entry point ------------------------------------------
+
+    def handle(self, pkt):
+        with self.lock:
+            self._handle_locked(pkt)
+
+    def _handle_locked(self, pkt):
+        if not pkt.haslayer(Dot11):
+            return
+        dot11 = pkt.getlayer(Dot11)
+
+        chan = 0
+        if pkt.haslayer(RadioTap):
+            chan = freq_to_channel(getattr(pkt.getlayer(RadioTap), "ChannelFrequency", None))
+
+        ftype = dot11.type
+        subtype = dot11.subtype
+
+        if ftype == 0:
+            cat = MGMT_SUBTYPES.get(subtype, f"mgmt_{subtype}")
+        elif ftype == 1:
+            cat = "control"
+        elif ftype == 2:
+            cat = "eapol" if pkt.haslayer(EAPOL) else "data"
+        else:
+            cat = "unknown"
+
+        M_FRAMES.labels(type=cat).inc()
+        if chan:
+            self.channels_seen.add(chan)
+            self.occ_all.add(chan)
+            if ftype == 0:
+                self.occ_mgmt.add(chan)
+
+        src = (dot11.addr2 or "").lower()
+        dst = (dot11.addr1 or "").lower()
+        bssid = (dot11.addr3 or "").lower()
+
+        if src and src != BROADCAST:
+            self.sink.topk("macs", src)
+
+        if cat in ("deauth", "disassoc"):
+            self.on_deauth(cat, src, dst, bssid, chan)
+        elif cat == "beacon":
+            self.on_beacon(src, bssid, ssid_from(pkt), chan)
+        elif cat == "probe_req":
+            self.on_probe_req(src, ssid_from(pkt), chan)
+        elif cat == "probe_resp":
+            self.on_probe_resp(src, bssid, ssid_from(pkt), chan)
+        elif cat in ("auth", "assoc_req", "reassoc_req"):
+            self.on_auth_assoc(cat, src, bssid, chan)
+        elif cat == "eapol":
+            self.on_eapol(src, dst, bssid, chan)
+
+        # Frame body is not retained beyond this point.
+
+    def occupancy_snapshot(self, window):
+        """Under the lock, read per-channel rates and prune every window.
+
+        Returns [(channel, frames_per_s, mgmt_frames_per_s)]. Holding the lock
+        here is what keeps handle() from mutating channels_seen / the deques
+        while we iterate and prune them.
+        """
+        out = []
+        with self.lock:
+            for chan in sorted(self.channels_seen):
+                total = self.occ_all.count(chan)
+                mgmt = self.occ_mgmt.count(chan)
+                out.append((chan, round(total / window, 2), round(mgmt / window, 2)))
+            for w in (
+                self.deauth_win,
+                self.auth_win,
+                self.handshake_win,
+                self.beacon_bssids,
+                self.ssid_bssids,
+                self.karma_ssids,
+                self.occ_all,
+                self.occ_mgmt,
+            ):
+                w.sweep()
+        return out
+
+
+# --------------------------------------------------------------------------
+# capture: Kismet live pcapng stream (in memory, never to disk)
+# --------------------------------------------------------------------------
+
+
+def read_creds(path):
+    user = passwd = None
+    for line in Path(path).read_text().splitlines():
+        if line.startswith("KISMET_USER="):
+            user = line.split("=", 1)[1].strip()
+        elif line.startswith("KISMET_PASS="):
+            passwd = line.split("=", 1)[1].strip()
+    return user, passwd
+
+
+def frame_stream_loop(cfg, detectors, stop):
+    url = cfg["kismet"]["url"].rstrip("/") + "/pcap/all_packets.pcapng"
+    user, passwd = read_creds(cfg["kismet"]["creds_file"])
+    delay = cfg["kismet"]["reconnect_s"]
+
+    while not stop.is_set():
+        try:
+            log.info("connecting to Kismet frame stream")
+            with requests.get(
+                url, auth=(user, passwd), stream=True, timeout=(10, None)
+            ) as resp:
+                resp.raise_for_status()
+                resp.raw.decode_content = True
+                M_STREAM_UP.set(1)
+                log.info("frame stream connected")
+                reader = PcapNgReader(resp.raw)
+                for pkt in reader:
+                    if stop.is_set():
+                        break
+                    try:
+                        detectors.handle(pkt)
+                    except Exception as exc:
+                        log.debug("frame handling error: %s", exc)
+        except Exception as exc:
+            log.warning("frame stream lost (%s); retrying in %ss", exc, delay)
+        finally:
+            M_STREAM_UP.set(0)
+        stop.wait(delay)
+
+
+# --------------------------------------------------------------------------
+# capture: Kismet's own WIDS alerts, normalized onto the same bus
+# --------------------------------------------------------------------------
+
+KISMET_ALERT_MAP = {
+    "DEAUTHFLOOD": ("DEAUTH_FLOOD", 8),
+    "BCASTDISCON": ("DEAUTH_FLOOD", 7),
+    "DISASSOCTRAFFIC": ("DEAUTH_HIT", 4),
+    "APSPOOF": ("EVIL_TWIN", 7),
+    "CRYPTODROP": ("EVIL_TWIN", 6),
+    "ADVCRYPTCHANGE": ("EVIL_TWIN", 6),
+    "BEACONRATE": ("BEACON_FLOOD", 6),
+    "KARMAOUI": ("KARMA_AP", 7),
+    "NULLPROBERESP": ("KARMA_AP", 5),
+    "CHANCHANGE": ("AP_CHANNEL_CHANGE", 4),
+    "NONCEREUSE": ("HANDSHAKE_ANOMALY", 8),
+    "NONCEDEGRADE": ("HANDSHAKE_ANOMALY", 8),
+    "WPSBRUTE": ("WPS_BRUTE", 7),
+}
+
+
+def alert_loop(cfg, sink, stop):
+    """Poll Kismet's alert endpoint and republish onto our schema."""
+    if not cfg["detect"]["kismet_alerts"]["enabled"]:
+        return
+    base = cfg["kismet"]["url"].rstrip("/")
+    user, passwd = read_creds(cfg["kismet"]["creds_file"])
+    acfg = cfg["detect"]["kismet_alerts"]
+    default_sev = acfg["default_severity"]
+    ignore_classes = {c.upper() for c in acfg.get("ignore_classes", [])}
+    delay = cfg["kismet"]["reconnect_s"]
+    last_ts = 0.0
+    # Kismet timestamps are floats but the endpoint takes an integer, so the
+    # same alert re-matches forever unless we also dedupe on its hash.
+    seen = deque(maxlen=4096)
+    seen_set = set()
+
+    while not stop.is_set():
+        try:
+            resp = requests.get(
+                f"{base}/alerts/last-time/{int(last_ts)}/alerts.json",
+                auth=(user, passwd),
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            M_ALERTS_UP.set(1)
+            alerts = data.get("kismet.alert.list", data) if isinstance(data, dict) else data
+            for a in alerts or []:
+                ts = a.get("kismet.alert.timestamp", 0)
+                last_ts = max(last_ts, float(ts or 0))
+
+                # SYSTEM alerts are Kismet talking about itself (logging
+                # disabled, running as root) — not wireless activity.
+                if (a.get("kismet.alert.class") or "").upper() in ignore_classes:
+                    continue
+
+                h = a.get("kismet.alert.hash")
+                if h is not None:
+                    if h in seen_set:
+                        continue
+                    if len(seen) == seen.maxlen:
+                        seen_set.discard(seen[0])
+                    seen.append(h)
+                    seen_set.add(h)
+
+                name = a.get("kismet.alert.header", "")
+                etype, sev = KISMET_ALERT_MAP.get(name, (f"KISMET_{name}", default_sev))
+                chan = a.get("kismet.alert.channel", "") or 0
+                try:
+                    chan = int(chan)
+                except (TypeError, ValueError):
+                    chan = 0
+                src = (a.get("kismet.alert.transmitter_mac") or "").lower()
+                tgt = (a.get("kismet.alert.dest_mac") or "").lower()
+                sink.emit(
+                    {
+                        "type": etype,
+                        "severity": sev,
+                        "channel": chan,
+                        "src_mac": src,
+                        "src_oui": oui_of(src),
+                        "vendor": vendor_of(src),
+                        "target_mac": tgt or None,
+                        "detail": a.get("kismet.alert.text", ""),
+                        "origin": "kismet",
+                        "kismet_alert": name,
+                        "frame_category": "alert",
+                    },
+                    cooldown_key=("kismet", name, src, tgt),
+                    cooldown_s=5,
+                )
+        except Exception as exc:
+            M_ALERTS_UP.set(0)
+            log.debug("alert poll failed: %s", exc)
+        stop.wait(delay)
+
+
+# --------------------------------------------------------------------------
+# periodic publishing: occupancy gauges + rollup snapshots
+# --------------------------------------------------------------------------
+
+
+def occupancy_loop(cfg, detectors, sink, stop):
+    interval = cfg["detect"]["occupancy"]["publish_interval_s"]
+    window = cfg["detect"]["occupancy"]["window_s"]
+    while not stop.is_set():
+        try:
+            for chan, rate, mrate in detectors.occupancy_snapshot(window):
+                M_OCCUPANCY.labels(channel=str(chan)).set(rate)
+                M_MGMT_RATE.labels(channel=str(chan)).set(mrate)
+                sink.gauge(
+                    f"occupancy/{chan}",
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "channel": chan,
+                        "frames_per_s": rate,
+                        "mgmt_frames_per_s": mrate,
+                        "window_s": window,
+                    },
+                )
+            sink.maintenance()
+        except Exception as exc:
+            log.debug("occupancy publish failed: %s", exc)
+        stop.wait(interval)
+
+
+def rollup_loop(cfg, sink, stop):
+    interval = cfg["detect"]["occupancy"]["publish_interval_s"] * 6
+    r = cfg.get("rollup", {})
+    db_path = None
+    if r.get("enabled"):
+        db_path = Path(r["db"])
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(db_path)
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS hourly (
+                    hour TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    count INTEGER NOT NULL,
+                    PRIMARY KEY (hour, event_type))"""
+        )
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS hourly_topk (
+                    hour TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    member TEXT NOT NULL,
+                    count INTEGER NOT NULL,
+                    PRIMARY KEY (hour, kind, member))"""
+        )
+        con.commit()
+        con.close()
+
+    last_write = 0
+    while not stop.is_set():
+        try:
+            snapshot = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "events_by_type": sink.counts_copy(),
+                "top_macs": sink.top_snapshot("macs"),
+                "top_probed_ssids": sink.top_snapshot("probed_ssids"),
+                "top_ssids": sink.top_snapshot("ssids"),
+                "top_attacked_bssids": sink.top_snapshot("attacked_bssids"),
+            }
+            sink.gauge("stats/rollup", snapshot)
+
+            now = time.time()
+            if db_path and now - last_write >= r["interval_s"]:
+                last_write = now
+                hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+                con = sqlite3.connect(db_path)
+                for etype, count in snapshot["events_by_type"].items():
+                    con.execute(
+                        "INSERT INTO hourly(hour,event_type,count) VALUES(?,?,?) "
+                        "ON CONFLICT(hour,event_type) DO UPDATE SET count=excluded.count",
+                        (hour, etype, count),
+                    )
+                for kind in ("macs", "probed_ssids", "ssids", "attacked_bssids"):
+                    for row in sink.top_snapshot(kind, 25):
+                        con.execute(
+                            "INSERT INTO hourly_topk(hour,kind,member,count) VALUES(?,?,?,?) "
+                            "ON CONFLICT(hour,kind,member) DO UPDATE SET count=excluded.count",
+                            (hour, kind, row["key"], row["count"]),
+                        )
+                con.commit()
+                con.close()
+                log.info("wrote hourly rollup for %s", hour)
+        except Exception as exc:
+            log.debug("rollup failed: %s", exc)
+        stop.wait(interval)
+
+
+# --------------------------------------------------------------------------
+
+
+def main():
+    logging.basicConfig(
+        level=os.environ.get("WIDS_LOGLEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    cfg = yaml.safe_load(Path(CONFIG_PATH).read_text())
+
+    sink = EventSink(cfg)
+    detectors = Detectors(cfg, sink)
+
+    start_http_server(cfg["prometheus"]["port"])
+    log.info("prometheus exporter on :%s", cfg["prometheus"]["port"])
+
+    stop = threading.Event()
+
+    def shutdown(signum, _frame):
+        log.info("signal %s, shutting down", signum)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    threads = [
+        threading.Thread(target=frame_stream_loop, args=(cfg, detectors, stop), daemon=True),
+        threading.Thread(target=alert_loop, args=(cfg, sink, stop), daemon=True),
+        threading.Thread(target=occupancy_loop, args=(cfg, detectors, sink, stop), daemon=True),
+        threading.Thread(target=rollup_loop, args=(cfg, sink, stop), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    while not stop.is_set():
+        stop.wait(1)
+    log.info("stopped")
+
+
+if __name__ == "__main__":
+    main()

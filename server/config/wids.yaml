@@ -1,0 +1,126 @@
+# WIDS detection daemon configuration.
+# Every threshold and window below is a starting point — tune at the venue.
+# Reload with: systemctl restart wids-detect
+
+# The management AP radio. Its MAC is auto-excluded from metrics so the rig
+# does not dominate its own top-K. Never put this interface in monitor mode.
+ap_interface: wlp2s0
+
+# Additional MACs to exclude from metrics (e.g. your own test kit).
+ignore_macs: []
+
+kismet:
+  url: http://127.0.0.1:2501
+  creds_file: /etc/wids/kismet.creds
+  # Seconds to wait before reconnecting if Kismet restarts or the stream drops.
+  reconnect_s: 5
+
+mqtt:
+  host: 127.0.0.1
+  port: 1883
+  topic_prefix: wids
+
+prometheus:
+  port: 9924
+
+redis:
+  host: 127.0.0.1
+  port: 6379
+  db: 0
+  # Bounded top-K: sorted sets are trimmed to this many members so cardinality
+  # can never run away, however busy the air gets.
+  topk_size: 100
+
+detect:
+  deauth:
+    window_s: 10
+    # Sustained deauths against one target per second before it counts as a
+    # flood rather than a single kick.
+    flood_rate: 20
+    flood_severity: 8
+    hit_severity: 3
+
+  beacon_flood:
+    window_s: 30
+    # Novel BSSIDs seen on one channel inside the window (mdk4-style blast).
+    novel_bssid_threshold: 30
+    severity: 7
+
+  evil_twin:
+    # One SSID advertised by at least this many distinct BSSIDs.
+    # Note: dual-band APs, mesh kits and enterprise deployments all legitimately
+    # put one SSID on several BSSIDs, so BSSID count alone false-positives
+    # constantly. We additionally require hardware from different vendors.
+    min_bssids: 3
+    min_distinct_ouis: 2
+    window_s: 300
+    severity: 6
+
+  karma:
+    # One BSSID probe-responding for this many different SSIDs.
+    window_s: 120
+    distinct_ssid_threshold: 5
+    severity: 7
+
+  auth_flood:
+    window_s: 10
+    # Auth/assoc requests against one BSSID inside the window.
+    threshold: 30
+    severity: 6
+
+  handshake:
+    window_s: 60
+    severity: 2
+
+  probe_watch:
+    severity: 4
+    # Operator watchlist. Case-insensitive substring match against the SSID in
+    # probe requests. Put corporate / con / target networks here.
+    watchlist:
+      - defcon
+      - corp
+      - guest
+
+  occupancy:
+    # How often the per-channel "how hot is the air" gauge is published.
+    publish_interval_s: 5
+    # Rolling window the frame rate is computed over.
+    window_s: 30
+
+  # Kismet ships a mature WIDS alert engine of its own (DEAUTHFLOOD, APSPOOF,
+  # BEACONRATE, KARMAOUI, ...). Its alerts are normalized onto the same bus
+  # alongside our detectors rather than duplicated.
+  kismet_alerts:
+    enabled: true
+    default_severity: 5
+    # Kismet alert classes to drop. SYSTEM is Kismet reporting on itself
+    # (logging disabled, running as root) rather than anything in the air.
+    ignore_classes:
+      - SYSTEM
+
+rollup:
+  # Hourly aggregates only — counts and top-K, never rows of raw observations.
+  enabled: true
+  db: /var/lib/wids/rollups.db
+  interval_s: 3600
+
+# ---------------------------------------------------------------------------
+# Dynamic channel controller (wids-chanctl). Reads per-channel occupancy off
+# the bus and parks each "tracker" radio (see /etc/wids/radios.conf) on the
+# hottest channel in its pool. Inert until at least one tracker radio exists.
+# ---------------------------------------------------------------------------
+chanctl:
+  enabled: true
+  # dry_run: log the decisions it WOULD make, but do not move any radio.
+  # Ships true so installing the feature changes nothing. Flip to false once
+  # the tracker radios are plugged in and configured.
+  dry_run: true
+  radios_conf: /etc/wids/radios.conf
+  eval_interval_s: 20      # how often to reconsider tracker placement
+  min_dwell_s: 45          # never move a tracker more often than this
+  move_margin: 1.5         # a challenger channel must beat the current one by
+                           # this factor before a move is justified (anti-flap)
+  quiet_floor: 3.0         # if a tracker's channel drops below this f/s, release
+                           # and re-pick even before move_margin is met
+  metric: frames_per_s     # ranking signal: frames_per_s or mgmt_frames_per_s
+  stale_after_s: 30        # ignore occupancy readings older than this

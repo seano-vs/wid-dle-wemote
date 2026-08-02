@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+wids-chanctl — dynamic channel controller.
+
+Some capture radios have role `tracker` in /etc/wids/radios.conf. This service
+parks each tracker on the busiest channel in its pool, following the air instead
+of blindly hopping it. Scouts and pins provide the wide/continuous coverage;
+trackers add depth where the action actually is (mostly a 5 GHz concern — on
+2.4 GHz everything lives on 1/6/11, which are already pinned).
+
+Design decisions baked in (see the build notes / README):
+  * Actuation is `iw dev <if> set channel N`. Kismet's REST set_channel is
+    broken on the mt76 driver; raw iw works for DFS and non-DFS alike, and
+    Kismet does not fight the channel of a non-hopping source.
+  * Ranking signal is per-channel occupancy read off MQTT (wids/occupancy/#),
+    published by wids-detect. No extra plumbing.
+  * dry_run (default) logs decisions without moving anything, so the feature is
+    inert until you have tracker radios and deliberately enable it.
+
+Passive: this only retunes receive channels. Nothing is transmitted.
+
+Caveat worth knowing: a tracker sitting on a channel continuously measures it,
+while candidate channels are only sampled by the hopping scout, so candidates
+read a little cold. move_margin + min_dwell absorb that; the quiet_floor makes
+a tracker leave a channel that has actually gone dead. Tune at the venue with
+dry_run on first.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import paho.mqtt.client as mqtt
+import yaml
+
+log = logging.getLogger("chanctl")
+CONFIG = os.environ.get("WIDS_CONFIG", "/etc/wids/wids.yaml")
+
+
+def load_radios(path):
+    """Parse radios.conf -> list of dicts. Ignores comments/blanks."""
+    radios = []
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        iface, mac, chipset, role, params = parts[0], parts[1], parts[2], parts[3], parts[4]
+        chans = [int(c) for c in params.split(",") if c.strip().isdigit()]
+        radios.append({"iface": iface, "mac": mac, "chipset": chipset,
+                       "role": role, "chans": chans})
+    return radios
+
+
+class Occupancy:
+    """Latest per-channel occupancy, fed from MQTT."""
+
+    def __init__(self, cfg):
+        self.metric = cfg["chanctl"]["metric"]
+        self.stale_after = cfg["chanctl"]["stale_after_s"]
+        self._d = {}  # channel -> (value, monotonic_ts)
+        self._lock = threading.Lock()
+        prefix = cfg["mqtt"]["topic_prefix"]
+        self.topic = f"{prefix}/occupancy/"
+
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="wids-chanctl")
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        self.client.reconnect_delay_set(min_delay=1, max_delay=30)
+        self.client.connect_async(cfg["mqtt"]["host"], cfg["mqtt"]["port"], keepalive=30)
+        self.client.loop_start()
+
+    def _on_connect(self, c, u, flags, rc, props=None):
+        c.subscribe(f"{self.topic}#")
+
+    def _on_message(self, c, u, msg):
+        try:
+            d = json.loads(msg.payload)
+            ch = int(d["channel"])
+            val = float(d.get(self.metric, 0.0))
+        except Exception:
+            return
+        with self._lock:
+            self._d[ch] = (val, time.monotonic())
+
+    def rate(self, ch):
+        with self._lock:
+            v = self._d.get(ch)
+        if not v:
+            return None
+        val, ts = v
+        if time.monotonic() - ts > self.stale_after:
+            return None
+        return val
+
+
+def current_channel(iface):
+    try:
+        out = subprocess.check_output(["iw", "dev", iface, "info"], text=True)
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("channel "):
+                return int(line.split()[1])
+    except Exception:
+        pass
+    return None
+
+
+def set_channel(iface, ch):
+    return subprocess.run(["iw", "dev", iface, "set", "channel", str(ch)],
+                          capture_output=True).returncode == 0
+
+
+class Tracker:
+    def __init__(self, radio, cfg):
+        self.iface = radio["iface"]
+        self.pool = radio["chans"]
+        self.parked = None
+        self.last_move = 0.0
+        c = cfg["chanctl"]
+        self.min_dwell = c["min_dwell_s"]
+        self.margin = c["move_margin"]
+        self.quiet_floor = c["quiet_floor"]
+
+    def evaluate(self, occ, reserved, dry_run):
+        """Decide and (unless dry_run) apply this tracker's channel.
+
+        reserved = channels covered by pins / other trackers, to avoid stacking.
+        """
+        now = time.monotonic()
+        live = current_channel(self.iface)
+        if self.parked is None and live is not None:
+            self.parked = live
+
+        # Rank pool channels we're allowed to use by their occupancy.
+        scored = []
+        for ch in self.pool:
+            if ch in reserved and ch != self.parked:
+                continue
+            r = occ.rate(ch)
+            if r is not None:
+                scored.append((ch, r))
+        if not scored:
+            return None
+        scored.sort(key=lambda kv: kv[1], reverse=True)
+        best_ch, best_rate = scored[0]
+
+        cur_rate = occ.rate(self.parked) if self.parked else None
+        reason = None
+
+        if self.parked is None:
+            reason = f"initial park on ch{best_ch} ({best_rate:.1f} f/s)"
+            target = best_ch
+        elif cur_rate is not None and cur_rate < self.quiet_floor and best_ch != self.parked:
+            reason = (f"ch{self.parked} went quiet ({cur_rate:.1f} < {self.quiet_floor}); "
+                      f"-> ch{best_ch} ({best_rate:.1f})")
+            target = best_ch
+        elif best_ch != self.parked and now - self.last_move >= self.min_dwell:
+            base = cur_rate if cur_rate is not None else 0.0
+            if best_rate >= max(base * self.margin, self.quiet_floor):
+                reason = (f"ch{best_ch} ({best_rate:.1f}) beats ch{self.parked} "
+                          f"({base:.1f}) by >{self.margin}x -> move")
+                target = best_ch
+            else:
+                return None
+        else:
+            return None
+
+        if dry_run:
+            log.info("[dry-run] %s: %s", self.iface, reason)
+            self.parked = target       # track intended state so logs make sense
+            self.last_move = now
+            return target
+
+        if set_channel(self.iface, target):
+            log.info("%s: %s", self.iface, reason)
+            self.parked = target
+            self.last_move = now
+            return target
+        log.warning("%s: failed to set channel %s", self.iface, target)
+        return None
+
+
+def main():
+    logging.basicConfig(level=os.environ.get("WIDS_LOGLEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(message)s")
+    cfg = yaml.safe_load(Path(CONFIG).read_text())
+    c = cfg.get("chanctl", {})
+
+    if not c.get("enabled", False):
+        log.info("chanctl disabled in config; exiting")
+        return 0
+
+    radios = load_radios(c["radios_conf"])
+    trackers = [Tracker(r, cfg) for r in radios if r["role"] == "tracker"]
+    # Channels held continuously by pins (and, later, other trackers).
+    pinned = {r["chans"][0] for r in radios if r["role"] == "pin" and r["chans"]}
+
+    dry_run = c.get("dry_run", True)
+    if not trackers:
+        log.info("no tracker radios in %s — nothing to manage. "
+                 "chanctl idle (this is expected until the extra 5 GHz sticks "
+                 "are added).", c["radios_conf"])
+        # Stay alive so the unit is 'active'; re-read config on restart.
+        stop = threading.Event()
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        stop.wait()
+        return 0
+
+    log.info("managing %d tracker(s): %s | dry_run=%s | pinned=%s",
+             len(trackers), [t.iface for t in trackers], dry_run, sorted(pinned))
+
+    occ = Occupancy(cfg)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+
+    interval = c["eval_interval_s"]
+    while not stop.is_set():
+        reserved = set(pinned) | {t.parked for t in trackers if t.parked is not None}
+        for t in trackers:
+            # A tracker doesn't reserve against itself.
+            others = reserved - ({t.parked} if t.parked is not None else set())
+            t.evaluate(occ, others, dry_run)
+        stop.wait(interval)
+
+    log.info("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

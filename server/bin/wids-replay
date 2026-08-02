@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+wids-replay — run captured frames through the live detection logic and show
+exactly what fires, without touching a radio or transmitting anything.
+
+    wids-replay sample.pcap                 # replay a capture file
+    wids-replay sample.pcapng --publish     # also publish to the real MQTT bus
+    wids-replay --from-air 30               # tap 30s of the live Kismet stream
+    wids-replay sample.pcap --speed 0       # as fast as possible (default)
+    wids-replay sample.pcap --speed 1       # honour original inter-frame timing
+
+This is the safe way to test detection against different packets: feed it a
+pcap from anywhere (a lab capture, a public sample, one you made against your
+own kit) and see which signatures trip and with what attribution.
+
+Timing note: detectors work over sliding *wall-clock* windows. Replaying a
+capture faster than real time compresses everything into one window, so rate
+thresholds trip more easily than they would live. --speed 1 replays at the
+original pace if you care about faithful rates.
+"""
+
+import argparse
+import collections
+import importlib.machinery
+import importlib.util
+import json
+import sys
+import time
+
+import yaml
+
+DAEMON = "/usr/local/sbin/wids-detect"
+CONFIG = "/etc/wids/wids.yaml"
+
+
+def load_daemon():
+    loader = importlib.machinery.SourceFileLoader("wids_detect", DAEMON)
+    spec = importlib.util.spec_from_loader("wids_detect", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class PrintSink:
+    """Prints events; optionally forwards them to the real bus."""
+
+    def __init__(self, publish=False, cfg=None):
+        self.events = []
+        self.ignore_macs = set()
+        self.counts = collections.Counter()
+        self.mqtt = None
+        if publish:
+            import paho.mqtt.client as mqtt
+
+            self.prefix = cfg["mqtt"]["topic_prefix"]
+            self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+            self.mqtt.connect(cfg["mqtt"]["host"], cfg["mqtt"]["port"], 30)
+            self.mqtt.loop_start()
+
+    def emit(self, ev, cooldown_key=None, cooldown_s=0):
+        self.events.append(ev)
+        self.counts[ev["type"]] += 1
+        src = ev.get("src_mac") or "-"
+        tgt = ev.get("target_mac") or "-"
+        bits = [f"sev={ev.get('severity')}", f"ch={ev.get('channel')}"]
+        for k in ("rate", "count", "ssid", "matched"):
+            if ev.get(k) is not None:
+                bits.append(f"{k}={ev[k]!r}" if k in ("ssid", "matched") else f"{k}={ev[k]}")
+        if ev.get("broadcast"):
+            bits.append("BROADCAST")
+        print(f"  {ev['type']:<18} {src} -> {tgt}  {' '.join(bits)}")
+        if self.mqtt:
+            self.mqtt.publish(f"{self.prefix}/events/{ev['type']}", json.dumps(ev), qos=0)
+        return True
+
+    def topk(self, *a, **k):
+        pass
+
+    def gauge(self, *a, **k):
+        pass
+
+
+def replay_file(path, det, speed):
+    from scapy.utils import PcapReader
+
+    n = 0
+    last_ts = None
+    with PcapReader(path) as pcap:
+        for pkt in pcap:
+            if speed and last_ts is not None:
+                delta = float(pkt.time) - last_ts
+                if 0 < delta < 5:
+                    time.sleep(delta / speed)
+            last_ts = float(pkt.time)
+            det.handle(pkt)
+            n += 1
+    return n
+
+
+def replay_air(seconds, det, cfg):
+    """Tap the live Kismet stream for a while — same frames the daemon sees."""
+    import requests
+    from scapy.utils import PcapNgReader
+
+    mod_creds = {}
+    for line in open(cfg["kismet"]["creds_file"]):
+        if "=" in line:
+            k, v = line.strip().split("=", 1)
+            mod_creds[k] = v
+    url = cfg["kismet"]["url"].rstrip("/") + "/pcap/all_packets.pcapng"
+    deadline = time.time() + seconds
+    n = 0
+    with requests.get(
+        url,
+        auth=(mod_creds.get("KISMET_USER"), mod_creds.get("KISMET_PASS")),
+        stream=True,
+        timeout=(10, None),
+    ) as resp:
+        resp.raise_for_status()
+        resp.raw.decode_content = True
+        for pkt in PcapNgReader(resp.raw):
+            det.handle(pkt)
+            n += 1
+            if time.time() > deadline:
+                break
+    return n
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("capture", nargs="?", help="pcap/pcapng file to replay")
+    ap.add_argument("--from-air", type=int, metavar="SECONDS",
+                    help="instead of a file, tap the live Kismet stream")
+    ap.add_argument("--publish", action="store_true",
+                    help="also publish resulting events to the real MQTT bus")
+    ap.add_argument("--speed", type=float, default=0,
+                    help="0 = as fast as possible (default), 1 = original timing")
+    args = ap.parse_args()
+
+    if not args.capture and not args.from_air:
+        ap.error("give a capture file or --from-air SECONDS")
+
+    cfg = yaml.safe_load(open(CONFIG))
+    mod = load_daemon()
+    sink = PrintSink(publish=args.publish, cfg=cfg)
+    det = mod.Detectors(cfg, sink)
+
+    print(f"\n{'=' * 64}")
+    if args.from_air:
+        print(f"tapping live air for {args.from_air}s")
+        n = replay_air(args.from_air, det, cfg)
+    else:
+        print(f"replaying {args.capture}"
+              + (" at original speed" if args.speed else " at full speed"))
+        n = replay_file(args.capture, det, args.speed)
+    print(f"{'=' * 64}")
+
+    print(f"\n{n} frames processed")
+    print("\nframe categories seen:")
+    from prometheus_client import REGISTRY
+
+    cats = {}
+    for metric in REGISTRY.collect():
+        if metric.name == "wids_frames":
+            for s in metric.samples:
+                if s.name.endswith("_total"):
+                    cats[s.labels.get("type", "?")] = int(s.value)
+    for cat, count in sorted(cats.items(), key=lambda kv: -kv[1]):
+        print(f"  {cat:<14} {count}")
+
+    print("\nevents fired:")
+    if sink.counts:
+        for etype, count in sink.counts.most_common():
+            print(f"  {etype:<18} {count}")
+    else:
+        print("  (none — nothing in this capture tripped a signature)")
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

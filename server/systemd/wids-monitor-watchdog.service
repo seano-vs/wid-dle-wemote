@@ -1,0 +1,8 @@
+[Unit]
+Description=Re-apply monitor mode to any WIDS radio that dropped out
+After=wids-monitor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wids-monitor-setup
+SuccessExitStatus=0 1

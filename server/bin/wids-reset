@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+wids-reset — wipe accumulated state so the rig starts on a clean slate.
+
+Intended use: run it on arrival at a venue so data from home/other networks
+doesn't clutter the con's numbers.
+
+Clears:
+  - Redis top-K sorted sets  (most-seen MACs / SSIDs / probed / attacked)
+  - SQLite hourly rollups     (archived by default; --purge to delete)
+  - Retained MQTT gauge topics (occupancy, rollup snapshot)
+  - In-memory Prometheus counters + sliding windows (via wids-detect restart)
+
+Optionally also:
+  --kismet   restart Kismet too, dropping its in-memory device list
+
+Destructive. Prompts once unless --yes. Only touches the rig's own state
+(the `wids:*` Redis namespace and the configured rollup DB) — nothing else.
+"""
+
+import argparse
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import yaml
+
+CONFIG = os.environ.get("WIDS_CONFIG", "/etc/wids/wids.yaml")
+DAEMON_UNIT = "wids-detect.service"
+KISMET_UNIT = "kismet.service"
+
+
+def need_root():
+    if os.geteuid() != 0:
+        sys.exit("wids-reset must run as root (restarts services). Try: sudo wids-reset")
+
+
+def systemctl(*args):
+    subprocess.run(["systemctl", *args], check=False)
+
+
+def clear_redis(cfg):
+    import redis
+
+    r = redis.Redis(
+        host=cfg["redis"]["host"],
+        port=cfg["redis"]["port"],
+        db=cfg["redis"]["db"],
+        socket_timeout=3,
+        decode_responses=True,
+    )
+    # Surgical: only our own namespace, never a blanket FLUSHDB.
+    keys = list(r.scan_iter(match="wids:*", count=500))
+    if keys:
+        r.delete(*keys)
+    return len(keys)
+
+
+def handle_rollups(cfg, purge):
+    r = cfg.get("rollup", {})
+    if not r.get("enabled"):
+        return "rollups disabled in config"
+    db = Path(r["db"])
+    if not db.exists():
+        return "no rollup DB present"
+    if purge:
+        db.unlink()
+        return f"deleted {db}"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = db.with_name(f"{db.name}.archived-{stamp}")
+    shutil.move(str(db), str(dest))
+    return f"archived -> {dest}"
+
+
+def clear_retained_mqtt(cfg, timeout=3.0):
+    import paho.mqtt.client as mqtt
+
+    prefix = cfg["mqtt"]["topic_prefix"]
+    found = []
+
+    def on_connect(c, u, flags, rc, props=None):
+        c.subscribe(f"{prefix}/occupancy/#")
+        c.subscribe(f"{prefix}/stats/#")
+
+    def on_message(c, u, msg):
+        # Only retained messages need clearing; live ones will just stop.
+        if msg.retain and msg.payload:
+            found.append(msg.topic)
+
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    c.on_connect = on_connect
+    c.on_message = on_message
+    try:
+        c.connect(cfg["mqtt"]["host"], cfg["mqtt"]["port"], 30)
+    except Exception as exc:
+        return f"MQTT unreachable ({exc})"
+    c.loop_start()
+    time.sleep(timeout)
+    for topic in set(found):
+        # Empty retained payload tells the broker to drop the retained value.
+        c.publish(topic, payload=b"", qos=0, retain=True)
+    time.sleep(0.5)
+    c.loop_stop()
+    c.disconnect()
+    return f"cleared {len(set(found))} retained topic(s)"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Reset WIDS stateful storage.")
+    ap.add_argument("--purge", action="store_true",
+                    help="delete the SQLite rollups instead of archiving them")
+    ap.add_argument("--kismet", action="store_true",
+                    help="also restart Kismet, dropping its in-memory device list")
+    ap.add_argument("--yes", "-y", action="store_true", help="skip the confirmation prompt")
+    args = ap.parse_args()
+
+    need_root()
+    cfg = yaml.safe_load(Path(CONFIG).read_text())
+
+    plan = [
+        "Redis top-K sorted sets (wids:*)         -> cleared",
+        f"SQLite hourly rollups                    -> {'DELETED' if args.purge else 'archived'}",
+        "Retained MQTT occupancy/rollup topics    -> cleared",
+        "Prometheus counters + sliding windows    -> reset (wids-detect restart)",
+    ]
+    if args.kismet:
+        plan.append("Kismet in-memory device list             -> reset (kismet restart)")
+
+    print("\nwids-reset will do the following:")
+    for p in plan:
+        print(f"  - {p}")
+    print()
+
+    if not args.yes:
+        try:
+            if input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("aborted, nothing changed.")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            print("\naborted, nothing changed.")
+            return 0
+
+    print()
+    # Stop the writer first so nothing races our clears or re-populates a gauge
+    # we just wiped.
+    print("stopping wids-detect ...")
+    systemctl("stop", DAEMON_UNIT)
+
+    try:
+        n = clear_redis(cfg)
+        print(f"  redis:   removed {n} key(s)")
+    except Exception as exc:
+        print(f"  redis:   FAILED ({exc})")
+
+    try:
+        print(f"  sqlite:  {handle_rollups(cfg, args.purge)}")
+    except Exception as exc:
+        print(f"  sqlite:  FAILED ({exc})")
+
+    try:
+        print(f"  mqtt:    {clear_retained_mqtt(cfg)}")
+    except Exception as exc:
+        print(f"  mqtt:    FAILED ({exc})")
+
+    if args.kismet:
+        print("restarting kismet ...")
+        systemctl("restart", KISMET_UNIT)
+        time.sleep(3)
+
+    print("starting wids-detect ...")
+    systemctl("start", DAEMON_UNIT)
+    time.sleep(2)
+
+    state = subprocess.run(
+        ["systemctl", "is-active", DAEMON_UNIT], capture_output=True, text=True
+    ).stdout.strip()
+    print(f"\nwids-detect is now: {state}")
+    print("clean slate ready." if state == "active" else "check: journalctl -u wids-detect")
+    return 0 if state == "active" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

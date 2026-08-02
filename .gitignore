@@ -1,0 +1,32 @@
+# Secrets — never commit these. They are generated on-box at install time.
+*.creds
+kismet.creds
+*_httpd.conf
+secrets/
+*.key
+*.pem
+
+# Runtime state / data — aggregates and logs stay on the box, not in VCS.
+*.db
+*.db3
+*.sqlite
+*.sqlite3
+rollups.db*
+*.log
+*.pcap
+*.pcapng
+*.kismet
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
