@@ -18,20 +18,26 @@ after feature extraction.
 |---|---|---|---|---|---|
 | `enp1s0` | — | `r8169` Realtek PCIe | — | n/a | LAN uplink (<BOX_LAN_IP>) |
 | `wlp2s0` | phy0 | `ath10k_pci` QCA6174 (built-in PCIe) | 2.4 + 5 GHz | capable, **never used** | Management AP (10.42.0.1) |
-| `mon0` | phy1 | `mt76x2u` MT7612U (USB) | 2.4 + 5 GHz | yes | Capture — hop 5 GHz low |
-| `mon1` | phy2 | `mt76x2u` MT7612U (USB) | 2.4 + 5 GHz | yes | Capture — hop 5 GHz high |
-| `mon2` | phy3 | `ath9k_htc` AR9271 (USB) | 2.4 GHz only | yes | Capture — pinned ch 1 |
-| `mon3` | phy4 | `ath9k_htc` AR9271 (USB) | 2.4 GHz only | yes | Capture — pinned ch 6 |
-| `mon4` | phy5 | `ath9k_htc` AR9271 (USB) | 2.4 GHz only | yes | Capture — pinned ch 11 |
+| `mon2` | phy… | `ath9k_htc` AR9271 (USB) | 2.4 GHz only | yes | Capture — pinned ch 1 |
+| `mon3` | phy… | `ath9k_htc` AR9271 (USB) | 2.4 GHz only | yes | Capture — pinned ch 6 |
+| `mon4` | phy… | `ath9k_htc` AR9271 (USB) | 2.4 GHz only | yes | Capture — pinned ch 11 |
+| `mon0` | phy… | `mt76x2u` MT7612U (USB) | 2.4 + 5 GHz | yes | Capture — hop UNII-1 (36–48) |
+| `mon1` | phy… | `mt76x2u` MT7612U (USB) | 2.4 + 5 GHz | yes | Capture — hop UNII-3 (149–165) |
+| `mon5` | phy… | `mt76x2u` MT7612U (USB) | 2.4 + 5 GHz | yes | Capture — **scout**, sweeps DFS |
+| `mon6` | phy… | `mt76x2u` MT7612U (USB) | 2.4 + 5 GHz | yes | Capture — **tracker** (wids-chanctl) |
 
 `wlp2s0` was confirmed as the built-in radio via `lspci` (PCIe QCA6174) before
 anything was configured. It is excluded from every monitor-mode path, by name,
 in `wids-monitor-setup` and in the Kismet source list.
 
-**Channel plan rationale.** The three 2.4 GHz-only AR9271s pin the
-non-overlapping channels 1/6/11 so that band is never unwatched. The two
-dual-band MT7612Us hop 5 GHz, split UNII-1/2 and UNII-2e/3, since 5 GHz has too
-many channels to pin usefully. Edit `/etc/wids/radios.conf` to change this.
+**Channel plan rationale (7 capture radios).** The three 2.4 GHz-only AR9271s
+pin the non-overlapping channels 1/6/11, so that band is never unwatched. The
+four MT7612Us cover 5 GHz: **mon0/mon1 hop the non-DFS blocks** (UNII-1 and
+UNII-3, where APs actually live); **mon5 is a scout** that sweeps the DFS range
+(52–64 + 100–144, including the TDWR band 120–128 that matters near an airport);
+**mon6 is a tracker** that `wids-chanctl` dynamically parks on whichever DFS
+channel is hottest. Edit `/etc/wids/radios.conf` to change roles. See the
+scout/tracker section under Operating.
 
 ### AR9271 firmware — read this before re-imaging
 
@@ -320,16 +326,11 @@ Why this design (from the build):
   its channel until *our own watchdog* reset it — which is why tracker radios are
   exempt from watchdog channel-pinning).
 
-### Adding the two extra 5 GHz radios
+### Adding more capture radios
 
-The rig is pre-wired for two more (identical MT7612U) 5 GHz sticks — the plan is
-to pin the current pair on the always-hot non-DFS blocks (UNII-1 ch 36, UNII-3
-ch 149) and use the new pair as a **scout** (sweeps all of 5 GHz incl. DFS) plus
-a **tracker** (dynamically parks on the hottest DFS block — including the TDWR
-band 120–128, the Vegas airport-radar hotspot the current 2-radio config never
-reaches).
-
-Procedure — plug in **one** stick, then:
+The reference build runs 7 capture radios (see §1) with `mon5`/`mon6` as the
+scout + DFS tracker, and `wids-chanctl` live (`dry_run: false`). To add another
+5 GHz stick to a running rig, plug in **one** at a time, then:
 
 ```bash
 sudo wids-add-radio            # detects the new interface, prompts role + pool
