@@ -30,3 +30,11 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Video player — deployment assets + runtime state, not code
+videos/
+*.mp4
+*.mkv
+*.mov
+*.webm
+video-positions.json

@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""
+wids-video — "channel surfing" TV output.
+
+Watches the WIDS event stream, figures out which Wi-Fi channel is currently
+DOMINANT (most detection events over a rolling window, with anti-flap
+hysteresis), and shows that channel's video on the HDMI/CRT via mpv on DRM.
+
+When the dominant channel changes it behaves like a TV changing channel: the
+outgoing video's playback position is saved, and the incoming channel's video
+RESUMES from wherever it was last left — never restarts from zero. Videos loop.
+
+Also publishes the dominant channel on `wids/stats/dominant` (retained) so other
+consumers (e.g. a future 7-segment "hottest channel" display) share the signal.
+
+Videos live in <video_dir> named by channel: 36.mp4, 149.mkv, ... plus a
+<fallback> clip (default "idle") shown when nothing is hot or a channel has no
+video. Passive/observer only — this just renders; it changes no radio state.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import threading
+import time
+from collections import defaultdict, deque
+from pathlib import Path
+
+import paho.mqtt.client as mqtt
+import yaml
+
+log = logging.getLogger("video")
+CONFIG = os.environ.get("WIDS_CONFIG", "/etc/wids/wids.yaml")
+
+
+# --------------------------------------------------------------------------
+# mpv JSON IPC over a unix socket
+# --------------------------------------------------------------------------
+
+
+class MpvIpc:
+    def __init__(self, sock_path):
+        self.sock_path = sock_path
+        self.sock = None
+        self._rid = 0
+        self._lock = threading.Lock()
+        self._resp = {}
+        self._resp_ev = {}
+        self._file_loaded = threading.Event()
+        self._stop = False
+
+    def connect(self, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(self.sock_path):
+                try:
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.connect(self.sock_path)
+                    self.sock = s
+                    threading.Thread(target=self._reader, daemon=True).start()
+                    return True
+                except OSError:
+                    pass
+            time.sleep(0.3)
+        return False
+
+    def _reader(self):
+        buf = b""
+        while not self._stop:
+            try:
+                chunk = self.sock.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if "request_id" in msg:
+                    rid = msg["request_id"]
+                    self._resp[rid] = msg
+                    ev = self._resp_ev.get(rid)
+                    if ev:
+                        ev.set()
+                elif msg.get("event") == "file-loaded":
+                    self._file_loaded.set()
+
+    def command(self, *args, timeout=4):
+        if not self.sock:
+            return None
+        with self._lock:
+            self._rid += 1
+            rid = self._rid
+        ev = threading.Event()
+        self._resp_ev[rid] = ev
+        payload = json.dumps({"command": list(args), "request_id": rid}) + "\n"
+        try:
+            self.sock.sendall(payload.encode())
+        except OSError:
+            return None
+        if not ev.wait(timeout):
+            return None
+        msg = self._resp.pop(rid, None)
+        self._resp_ev.pop(rid, None)
+        if msg and msg.get("error") == "success":
+            return msg.get("data")
+        return None
+
+    def get_time_pos(self):
+        v = self.command("get_property", "time-pos")
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def load(self, path, resume_at=0.0, wait=5):
+        """Load a file (replace), then resume it at resume_at seconds."""
+        self._file_loaded.clear()
+        self.command("loadfile", path, "replace")
+        if self._file_loaded.wait(wait) and resume_at and resume_at > 0.5:
+            # small settle so the demuxer is ready to seek
+            time.sleep(0.15)
+            self.command("set_property", "time-pos", resume_at)
+
+    def close(self):
+        self._stop = True
+        try:
+            if self.sock:
+                self.sock.close()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# dominant-channel tracking (events per channel, rolling window + hysteresis)
+# --------------------------------------------------------------------------
+
+
+class DominantTracker:
+    def __init__(self, cfg):
+        d = cfg["dominant"]
+        self.window_s = d["window_s"]
+        self.min_dwell = d["min_dwell_s"]
+        self.margin = d["switch_margin"]
+        self.min_events = d["min_events"]
+        self._events = defaultdict(deque)  # channel -> deque[timestamps]
+        self._lock = threading.Lock()
+        self.current = None       # currently published dominant channel (or None)
+        self.last_switch = 0.0
+
+    def record(self, channel, now=None):
+        if not channel or channel <= 0:
+            return
+        now = now or time.time()
+        with self._lock:
+            self._events[channel].append(now)
+
+    def _counts(self, now):
+        cutoff = now - self.window_s
+        out = {}
+        for ch, dq in list(self._events.items()):
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if dq:
+                out[ch] = len(dq)
+            else:
+                del self._events[ch]
+        return out
+
+    def evaluate(self):
+        """Return (dominant_channel_or_None, changed_bool)."""
+        now = time.time()
+        with self._lock:
+            counts = self._counts(now)
+
+        if not counts:
+            leader, lead_n = None, 0
+        else:
+            leader = max(counts, key=counts.get)
+            lead_n = counts[leader]
+
+        cur = self.current
+        cur_n = counts.get(cur, 0) if cur is not None else 0
+        changed = False
+
+        if cur is None:
+            # nothing playing (or on fallback): take the leader if it clears the floor
+            if leader is not None and lead_n >= self.min_events:
+                self.current, self.last_switch, changed = leader, now, True
+        else:
+            dwell_ok = now - self.last_switch >= self.min_dwell
+            if cur_n == 0 and dwell_ok:
+                # current channel went silent -> leader (or fallback if none)
+                self.current = leader if (leader and lead_n >= self.min_events) else None
+                self.last_switch, changed = now, True
+            elif (leader is not None and leader != cur and dwell_ok
+                  and lead_n >= max(cur_n * self.margin, self.min_events)):
+                self.current, self.last_switch, changed = leader, now, True
+
+        return self.current, changed
+
+
+# --------------------------------------------------------------------------
+# video controller: owns the mpv process + switching/resume
+# --------------------------------------------------------------------------
+
+
+class VideoController:
+    def __init__(self, cfg):
+        v = cfg["video"]
+        self.video_dir = Path(v["video_dir"])
+        self.fallback = v.get("fallback", "idle")
+        self.connector = v.get("drm_connector") or ""
+        self.drm_mode = v.get("drm_mode") or ""   # e.g. "720x480" for a tiny CRT
+        self.sock_path = v.get("mpv_socket", "/run/wids/mpv.sock")
+        self.audio = v.get("audio", False)
+        self.pos_file = Path(v.get("positions_file", "/var/lib/wids/video-positions.json"))
+
+        self.positions = self._load_positions()
+        self.cur_slot = None       # key into positions: str(channel) or "idle"
+        self.mpv_proc = None
+        self.ipc = None
+
+    # -- positions persistence ------------------------------------------
+
+    def _load_positions(self):
+        try:
+            return {k: float(v) for k, v in json.loads(self.pos_file.read_text()).items()}
+        except Exception:
+            return {}
+
+    def _save_positions(self):
+        try:
+            self.pos_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pos_file.write_text(json.dumps(self.positions))
+        except Exception as exc:
+            log.debug("could not persist positions: %s", exc)
+
+    # -- file resolution -------------------------------------------------
+
+    def _find(self, stem):
+        for p in sorted(self.video_dir.glob(f"{stem}.*")):
+            if p.suffix.lower() in (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"):
+                return p
+        return None
+
+    def resolve(self, channel):
+        """(slot_key, path) for the given dominant channel (None => fallback)."""
+        if channel is not None:
+            p = self._find(str(channel))
+            if p:
+                return str(channel), p
+        return "idle", self._find(self.fallback)
+
+    # -- mpv lifecycle ---------------------------------------------------
+
+    def start_mpv(self):
+        args = [
+            "mpv", "--idle=yes", "--vo=drm",
+            f"--input-ipc-server={self.sock_path}",
+            "--loop-file=inf", "--no-osc", "--osd-level=0",
+            "--no-input-default-bindings", "--really-quiet", "--no-config",
+            "--profile=low-latency", "--hwdec=no",
+        ]
+        if self.connector:
+            args.append(f"--drm-connector={self.connector}")
+        if self.drm_mode:
+            args.append(f"--drm-mode={self.drm_mode}")
+        args.append("--no-audio" if not self.audio else "--audio=auto")
+        try:
+            os.unlink(self.sock_path)
+        except OSError:
+            pass
+        log.info("launching mpv: %s", " ".join(args))
+        self.mpv_proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL)
+        self.ipc = MpvIpc(self.sock_path)
+        if not self.ipc.connect():
+            log.error("mpv IPC socket never appeared")
+            return False
+        return True
+
+    def mpv_alive(self):
+        return self.mpv_proc is not None and self.mpv_proc.poll() is None
+
+    # -- the switch (with resume) ---------------------------------------
+
+    def switch_to(self, channel):
+        slot, path = self.resolve(channel)
+        if slot == self.cur_slot:
+            return
+        if path is None:
+            log.warning("no video for %s and no fallback present", channel)
+            return
+
+        # save where we're leaving
+        if self.cur_slot is not None and self.ipc:
+            pos = self.ipc.get_time_pos()
+            if pos is not None:
+                self.positions[self.cur_slot] = pos
+
+        resume_at = self.positions.get(slot, 0.0)
+        log.info("channel-change -> %s (%s) resume@%.1fs", channel or "idle",
+                 path.name, resume_at)
+        self.ipc.load(str(path), resume_at=resume_at)
+        self.cur_slot = slot
+        self._save_positions()
+
+    def checkpoint(self):
+        """Periodically snapshot the current position so a crash loses little."""
+        if self.cur_slot is not None and self.ipc:
+            pos = self.ipc.get_time_pos()
+            if pos is not None:
+                self.positions[self.cur_slot] = pos
+                self._save_positions()
+
+    def stop(self):
+        if self.ipc:
+            self.checkpoint()
+            self.ipc.close()
+        if self.mpv_proc:
+            self.mpv_proc.terminate()
+
+
+# --------------------------------------------------------------------------
+
+
+def main():
+    logging.basicConfig(level=os.environ.get("WIDS_LOGLEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(message)s")
+    cfg = yaml.safe_load(Path(CONFIG).read_text())
+    if not cfg.get("video", {}).get("enabled", False):
+        log.info("video disabled in config; exiting")
+        return 0
+
+    tracker = DominantTracker(cfg)
+    vc = VideoController(cfg)
+    prefix = cfg["mqtt"]["topic_prefix"]
+    pub_interval = cfg["dominant"]["publish_interval_s"]
+
+    if not vc.start_mpv():
+        return 1
+
+    # MQTT: feed the tracker from the event stream; publish the dominant stat.
+    mqc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="wids-video")
+
+    def on_connect(c, u, flags, rc, props=None):
+        c.subscribe(f"{prefix}/events/#")
+
+    def on_message(c, u, msg):
+        try:
+            d = json.loads(msg.payload)
+            tracker.record(int(d.get("channel", 0)))
+        except Exception:
+            pass
+
+    mqc.on_connect = on_connect
+    mqc.on_message = on_message
+    mqc.reconnect_delay_set(min_delay=1, max_delay=30)
+    mqc.connect_async(cfg["mqtt"]["host"], cfg["mqtt"]["port"], keepalive=30)
+    mqc.loop_start()
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+
+    # start on the fallback so the screen is never black
+    vc.switch_to(None)
+
+    last_ckpt = 0.0
+    while not stop.is_set():
+        if not vc.mpv_alive():
+            log.warning("mpv exited; relaunching")
+            if vc.start_mpv():
+                vc.cur_slot = None
+                vc.switch_to(tracker.current)
+            else:
+                stop.wait(3)
+                continue
+
+        dominant, changed = tracker.evaluate()
+        # publish the dominant channel (retained) for other consumers
+        mqc.publish(f"{prefix}/stats/dominant",
+                    json.dumps({"channel": dominant, "ts": time.time()}),
+                    qos=0, retain=True)
+        if changed:
+            vc.switch_to(dominant)
+
+        now = time.time()
+        if now - last_ckpt >= 30:
+            vc.checkpoint()
+            last_ckpt = now
+
+        stop.wait(pub_interval)
+
+    log.info("shutting down")
+    vc.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

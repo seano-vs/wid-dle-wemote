@@ -78,5 +78,7 @@ GPLv3 — see [LICENSE](LICENSE).
 
 ## Status
 
-Server rig: built and running. LED controller: contract documented, firmware not
-yet written. See `led-controller/README.md`.
+Server rig: built and running (7 capture radios, dynamic 5 GHz scout/tracker).
+Video wall: built — the HDMI/CRT channel-surfs to the dominant Wi-Fi channel,
+resuming each clip where it left off (`server/README.md` §8b). LED controller:
+contract documented, firmware not yet written (`led-controller/README.md`).

@@ -7,8 +7,10 @@
 # Prerequisites (not installed here — they involve a third-party apt key and
 # your own review; see server/README.md):
 #   - Kismet (kismet-core, kismet-capture-linux-wifi) from kismetwireless.net
-#   - mosquitto, redis-server, iw, rfkill, tcpdump, bc
+#   - mosquitto, redis-server, iw, rfkill, tcpdump, bc, socat
 #   - python3 packages: paho-mqtt, redis, prometheus-client, scapy, pyyaml
+#   - mpv, ffmpeg, fonts-dejavu-core   (video output; ffmpeg/fonts only for
+#     make-test-videos.sh)
 #   - AR9271 firmware if you use those radios (see README §1)
 
 set -euo pipefail
@@ -19,6 +21,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "==> directories"
 install -d -m 750 /etc/wids
 install -d -m 755 /var/lib/wids
+install -d -m 755 /var/lib/wids/videos   # drop <channel>.mp4 + a fallback clip here
 install -d -m 700 /root/.kismet
 
 echo "==> operator tools -> /usr/local/sbin"
@@ -98,5 +101,11 @@ Installed. Next:
        systemctl enable --now wids-monitor.service wids-monitor-watchdog.timer
        systemctl enable --now kismet wids-detect wids-chanctl
   3. Verify:  sudo wids-healthcheck
+  4. Video wall (optional): drop <channel>.mp4 files + a fallback in
+     /var/lib/wids/videos (or run ./make-test-videos.sh), hand the HDMI console
+     to mpv, and start it:
+       systemctl mask --now getty@tty1      # give the screen to the video wall
+       systemctl enable --now wids-video
+     (Set video.drm_mode in wids.yaml to your display's safe mode.)
 Full manual: /etc/wids/README.md
 NEXT

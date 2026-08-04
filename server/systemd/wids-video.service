@@ -1,0 +1,23 @@
+[Unit]
+Description=WIDS channel-surfing video output (mpv on DRM, dominant-channel driven)
+After=wids-detect.service mosquitto.service
+Wants=wids-detect.service mosquitto.service
+
+[Service]
+Type=simple
+# Creates /run/wids for the mpv IPC socket.
+RuntimeDirectory=wids
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/sbin/wids-video
+Restart=always
+RestartSec=5
+# mpv --vo=drm needs the render/DRM devices and the console.
+SupplementaryGroups=video render
+# Give up the framebuffer console so mpv can take DRM master cleanly.
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

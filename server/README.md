@@ -424,6 +424,37 @@ managed mode and watching it get restored.
 
 ---
 
+## 8b. Video output — channel surfing (`wids-video`)
+
+The box drives an HDMI display (a tiny composite CRT in the reference build) that
+**"changes the channel" to wherever the action is**: it plays the video mapped to
+the currently **dominant** Wi-Fi channel (most detection events over a rolling
+window), and switches like a TV when a different channel takes over.
+
+- **mpv on DRM/KMS** — no X. Runs as DRM master on tty1 (the `getty@tty1` console
+  is masked so mpv owns the screen; `sudo systemctl unmask --now getty@tty1` to
+  get the login console back). Forced to `--drm-mode=720x480` for the CRT.
+- **Resume, not restart.** On a channel change the outgoing video's timestamp is
+  saved and the incoming channel's video **resumes where it was last left**.
+  Positions persist to `/var/lib/wids/video-positions.json`, surviving restarts.
+- **Videos** live in `/var/lib/wids/videos/` named by channel — `36.mp4`,
+  `149.mkv`, … — plus a `fallback` clip (default `idle`) shown when nothing is
+  hot or a channel has no video. `make-test-videos.sh` generates labeled test
+  clips (channel + running timecode) for bring-up.
+- **Dominant-channel signal** is published on `wids/stats/dominant` (retained),
+  so the future 7-segment "hottest channel" display reads the same value.
+
+Config lives under `video:` and `dominant:` in `wids.yaml` (window, anti-flap
+`min_dwell_s` / `switch_margin`, `min_events`, the DRM connector/mode, the video
+directory). Drop your own `<channel>.mp4` files in and they take over.
+
+```bash
+journalctl -u wids-video -f                      # what it's doing
+mosquitto_sub -t wids/stats/dominant -v          # current dominant channel
+```
+
+---
+
 ## 9. Seams for phase 2 — documented, deliberately unbuilt
 
 ### 9.1 LED bridge (ESP32 over USB serial)
