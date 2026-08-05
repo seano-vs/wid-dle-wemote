@@ -1,0 +1,15 @@
+[Unit]
+Description=WIDS LED wall bridge (MQTT detections -> Nano Every over serial)
+After=wids-detect.service mosquitto.service
+Wants=wids-detect.service mosquitto.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wids-led-bridge
+Restart=always
+RestartSec=5
+# Waits internally for /dev/wids-led, so it sits quietly until the Nano Every
+# is plugged into this box.
+
+[Install]
+WantedBy=multi-user.target

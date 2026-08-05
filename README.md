@@ -80,5 +80,6 @@ GPLv3 — see [LICENSE](LICENSE).
 
 Server rig: built and running (7 capture radios, dynamic 5 GHz scout/tracker).
 Video wall: built — the HDMI/CRT channel-surfs to the dominant Wi-Fi channel,
-resuming each clip where it left off (`server/README.md` §8b). LED controller:
-contract documented, firmware not yet written (`led-controller/README.md`).
+resuming each clip where it left off (`server/README.md` §8b). LED wall: built —
+28 SK6812 RGBW on an Arduino Nano Every; attacks flare the channel button + its
+signature LED, driven from the bus by `wids-led-bridge` (`led-controller/README.md`).

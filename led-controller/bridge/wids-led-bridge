@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+wids-led-bridge — turns live WIDS detections into LED-wall commands.
+
+Subscribes to the MQTT bus and drives the Nano Every firmware over USB serial:
+  * an event (channel + type + severity) flares BOTH the channel's button LED
+    and the matching signature LED, coloured by severity;
+  * per-channel occupancy sets a dim "this channel is busy" ambient glow.
+
+Reliability: the firmware emits a '>' ready-prompt after every LED refresh (the
+refresh briefly disables interrupts and would drop a byte arriving then). This
+bridge only sends in the gap right after a '>', so no command is ever lost.
+
+Modes:
+  (default)   subscribe MQTT, drive the serial LED wall
+  --dry-run   subscribe MQTT, PRINT the commands instead of opening serial
+  --demo      no MQTT; generate synthetic events to the serial wall
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import logging
+import os
+import random
+import signal
+import threading
+import time
+from pathlib import Path
+
+import yaml
+
+log = logging.getLogger("led")
+CONFIG = os.environ.get("WIDS_CONFIG", "/etc/wids/wids.yaml")
+
+# --- physical wiring map (chain index 0 = closest to the board) --------------
+# Signatures 0-7, then channels 8-27, exactly as the strip is soldered.
+TYPE_LED = {
+    "AUTH_FLOOD": 0, "PROBE_WATCH": 1, "KARMA_AP": 2, "HANDSHAKE_SEEN": 3,
+    "EVIL_TWIN": 4, "BEACON_FLOOD": 5, "DEAUTH_HIT": 6, "DEAUTH_FLOOD": 7,
+}
+CHAN_LED = {
+    165: 8, 161: 9, 157: 10, 153: 11, 104: 12, 108: 13, 112: 14, 149: 15,
+    100: 16, 64: 17, 60: 18, 56: 19, 40: 20, 44: 21, 48: 22, 52: 23,
+    36: 24, 11: 25, 6: 26, 1: 27,
+}
+
+
+def sev_color(sev):
+    """Severity -> (R,G,B,W). White die carries the calm end; red = attack."""
+    try:
+        sev = max(1, min(10, int(sev)))
+    except (TypeError, ValueError):
+        sev = 5
+    if sev >= 7:
+        return (255, 0, 0, 0)          # red — attack
+    if sev >= 4:
+        return (255, 110, 0, 0)        # amber — notable
+    return (10, 40, 140, 70)           # calm blue-white — low
+
+
+class Wall:
+    """Owns the serial link + the '>'-gated send queue (or dry-run printing)."""
+
+    def __init__(self, cfg, dry_run=False):
+        c = cfg.get("led", {})
+        self.flare_ms = c.get("flare_ms", 700)
+        self.occ_max = c.get("occ_ambient_max", 70)
+        self.occ_scale = c.get("occ_scale", 2.0)
+        self.cap = c.get("cmds_per_frame", 6)
+        self.dry = dry_run
+        self.q = collections.deque(maxlen=256)
+        self.lock = threading.Lock()
+        self.ser = None
+        if not dry_run:
+            import serial
+            port = c.get("serial_port", "/dev/wids-led")
+            baud = c.get("baud", 115200)
+            while True:                # wait for the board rather than crash-looping
+                try:
+                    self.ser = serial.Serial(port, baud, timeout=0)
+                    break
+                except (OSError, serial.SerialException) as e:
+                    log.warning("LED board not present on %s (%s); retrying in 3s", port, e)
+                    time.sleep(3)
+            log.info("opened %s; waiting for firmware boot", port)
+            time.sleep(2.0)            # opening resets the board
+            self.ser.reset_input_buffer()
+
+    def enqueue(self, line):
+        if self.dry:
+            print(line)
+            return
+        with self.lock:
+            self.q.append(line)
+
+    # -- semantic helpers -----------------------------------------------
+    def event(self, channel, etype, severity):
+        r, g, b, w = sev_color(severity)
+        d = self.flare_ms
+        for idx in (CHAN_LED.get(channel), TYPE_LED.get(etype)):
+            if idx is not None:
+                self.enqueue(f"F {idx} {r} {g} {b} {w} {d}")
+
+    def occupancy(self, channel, fps):
+        idx = CHAN_LED.get(channel)
+        if idx is None:
+            return
+        level = int(min(self.occ_max, max(0.0, fps) * self.occ_scale))
+        self.enqueue(f"A {idx} {level}")
+
+    def clear(self):
+        self.enqueue("C")
+
+    # -- the '>'-gated pump ---------------------------------------------
+    def run(self, stop):
+        if self.dry:
+            stop.wait()
+            return
+        buf = b""
+        while not stop.is_set():
+            buf += self.ser.read(64) or b""
+            if b">" in buf:               # firmware just refreshed -> safe window
+                buf = b""
+                sent = 0
+                while sent < self.cap:
+                    with self.lock:
+                        if not self.q:
+                            break
+                        line = self.q.popleft()
+                    self.ser.write((line + "\n").encode())
+                    sent += 1
+            else:
+                time.sleep(0.003)
+
+
+def run_mqtt(cfg, wall, stop):
+    import paho.mqtt.client as mqtt
+    prefix = cfg["mqtt"]["topic_prefix"]
+
+    def on_connect(c, u, flags, rc, props=None):
+        c.subscribe(f"{prefix}/events/#")
+        c.subscribe(f"{prefix}/occupancy/#")
+        log.info("subscribed to %s events + occupancy", prefix)
+
+    def on_message(c, u, msg):
+        try:
+            d = json.loads(msg.payload)
+        except Exception:
+            return
+        if "/events/" in msg.topic:
+            ch = d.get("channel")
+            wall.event(int(ch) if ch else 0, d.get("type", ""), d.get("severity", 5))
+        elif "/occupancy/" in msg.topic:
+            wall.occupancy(int(d.get("channel", 0)), float(d.get("frames_per_s", 0)))
+
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="wids-led-bridge")
+    c.on_connect = on_connect
+    c.on_message = on_message
+    c.reconnect_delay_set(min_delay=1, max_delay=30)
+    c.connect_async(cfg["mqtt"]["host"], cfg["mqtt"]["port"], keepalive=30)
+    c.loop_start()
+    stop.wait()
+    c.loop_stop()
+
+
+def run_demo(wall, stop):
+    """Synthetic events so the wall can be exercised with no live bus."""
+    demo = [
+        (6, "DEAUTH_FLOOD", 8), (44, "EVIL_TWIN", 6), (1, "HANDSHAKE_SEEN", 2),
+        (149, "KARMA_AP", 7), (11, "AUTH_FLOOD", 6), (36, "PROBE_WATCH", 4),
+        (100, "BEACON_FLOOD", 7), (6, "DEAUTH_HIT", 3),
+    ]
+    for ch in (1, 6, 11):
+        wall.occupancy(ch, 20)
+    while not stop.is_set():
+        ch, t, s = random.choice(demo)
+        log.info("demo event: %s ch%s sev%s", t, ch, s)
+        wall.event(ch, t, s)
+        stop.wait(1.5)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="print commands, no serial")
+    ap.add_argument("--demo", action="store_true", help="synthetic events, no MQTT")
+    args = ap.parse_args()
+    logging.basicConfig(level=os.environ.get("WIDS_LOGLEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(message)s")
+    cfg = yaml.safe_load(Path(CONFIG).read_text())
+    if not cfg.get("led", {}).get("enabled", True) and not (args.demo or args.dry_run):
+        log.info("led disabled in config; exiting")
+        return 0
+
+    wall = Wall(cfg, dry_run=args.dry_run)
+    wall.clear()
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+
+    driver = threading.Thread(target=run_demo if args.demo else run_mqtt,
+                              args=(wall, stop) if args.demo else (cfg, wall, stop),
+                              daemon=True)
+    driver.start()
+    wall.run(stop)          # the '>'-gated pump owns the main thread
+    log.info("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
