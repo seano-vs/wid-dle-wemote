@@ -19,7 +19,7 @@ PROM_PORT=${PROM_PORT:-9924}
 
 echo
 echo "=== services ==="
-for svc in hostapd dnsmasq wids-monitor mosquitto redis-server kismet wids-detect wids-chanctl wids-video; do
+for svc in hostapd dnsmasq wids-monitor mosquitto redis-server kismet wids-detect wids-chanctl wids-video wids-led-bridge; do
     state=$(systemctl is-active "$svc" 2>/dev/null)
     if [[ $state == active ]]; then ok "$svc"; else bad "$svc ($state)"; fi
 done
