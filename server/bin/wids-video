@@ -155,6 +155,10 @@ class DominantTracker:
         self.min_dwell = d["min_dwell_s"]
         self.margin = d["switch_margin"]
         self.min_events = d["min_events"]
+        # Only these channels can win the TV — the ones with buttons/LEDs on the
+        # remote. Keeps DFS scan channels (116-144, no button/video) from
+        # hijacking the display to the fallback. Empty/absent => all channels.
+        self.allowed = set(d.get("channels") or []) or None
         self._events = defaultdict(deque)  # channel -> deque[timestamps]
         self._lock = threading.Lock()
         self.current = None       # currently published dominant channel (or None)
@@ -162,6 +166,8 @@ class DominantTracker:
 
     def record(self, channel, now=None):
         if not channel or channel <= 0:
+            return
+        if self.allowed is not None and channel not in self.allowed:
             return
         now = now or time.time()
         with self._lock:

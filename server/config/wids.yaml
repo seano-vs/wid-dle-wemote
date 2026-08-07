@@ -144,6 +144,7 @@ dominant:
   min_dwell_s: 12       # don't change channel more often than this (anti-flap)
   switch_margin: 1.3    # a challenger must beat the current channel by this factor
   min_events: 3         # ignore channels with fewer than this many events in-window
+  channels: [1,6,11,36,40,44,48,52,56,60,64,100,104,108,112,149,153,157,161,165]   # only button/LED channels can win the TV
   publish_interval_s: 3
 
 # ---------------------------------------------------------------------------
